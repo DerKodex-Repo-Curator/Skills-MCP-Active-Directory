@@ -8,6 +8,7 @@ Nothing here changes single-AD behaviour: the pool is only instantiated when
 """
 
 import logging
+import threading
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -56,6 +57,48 @@ class ADServerPool:
         )
 
     # ------------------------------------------------------------------ names
+
+    def esta_conectado(self, key: str) -> bool:
+        """Whether this directory already holds an open LDAP connection.
+
+        Cheap and side-effect free: it never opens one. Used to tell a
+        directory that is merely SLOW TO CONNECT from one that is not
+        answering (see the fan-out deadline).
+        """
+        bundle = self._bundles.get(key)
+        if bundle is None:
+            return False
+        try:
+            return bool(bundle.ldap_manager.get_connection_stats().get("connected"))
+        except Exception:  # noqa: BLE001 - unknown means "not connected"
+            return False
+
+    def aquecer(self, em_segundo_plano: bool = True) -> Optional[threading.Thread]:
+        """Open every enabled directory's connection at boot.
+
+        @MX:REASON Measured 2026-09-21 in production: a model asked for one
+        account with no ad_server; one tenant answered in 49 ms because it was
+        already connected, which started the 3 s grace the fan-out gives the
+        others -- and three HEALTHY directories were cut while still doing
+        their first TLS handshake and bind. The operator saw "tempo esgotado"
+        for directories that were fine. Warming up removes the cold first call;
+        the fan-out also stops counting the grace against a directory that is
+        still connecting.
+        """
+        def trabalho():
+            for key in self.available_names():
+                try:
+                    self._get_or_build(key).ldap_manager.connect()
+                    logger.info("Conexao aquecida: %s", key)
+                except Exception as exc:  # noqa: BLE001 - a dead AD must not stop the rest
+                    logger.warning("Aquecimento falhou em '%s': %s", key, str(exc)[:200])
+
+        if not em_segundo_plano:
+            trabalho()
+            return None
+        thread = threading.Thread(target=trabalho, name="ad-aquecimento", daemon=True)
+        thread.start()
+        return thread
 
     def available_names(self, only_enabled: bool = True) -> List[str]:
         return [
@@ -227,6 +270,11 @@ class ADServerPool:
         bundle = self._bundles.get(key)
         if bundle is None:
             return "nao_conectado", "Nenhuma operacao foi executada neste servidor ainda."
+        estado = getattr(bundle.ldap_manager, "estado_de_disponibilidade", None)
+        if callable(estado):
+            disponibilidade = estado()
+            if disponibilidade.get("indisponivel"):
+                return "indisponivel", disponibilidade.get("ultima_falha")
         try:
             stats = bundle.ldap_manager.get_connection_stats()
             if stats.get("connected"):
@@ -248,7 +296,10 @@ class ADServerPool:
             "servidores": servers,
             "como_usar": (
                 "Passe o valor do campo 'ad_server' no parametro ad_server das demais "
-                "tools. Em operacoes de escrita, confirme tambem com client_confirmation."
+                "tools. Consultas aceitam ad_server='todos' quando nao se sabe em qual AD "
+                "a pessoa esta. Usuarios, grupos, computadores e OUs podem ser informados "
+                "por nome, parte do nome, login, e-mail ou DN. client_confirmation so e "
+                "necessario se uma resposta pedir CONFIRMACAO NECESSARIA."
             ),
             "nota_de_seguranca": (
                 "Credenciais de bind nao sao expostas por esta tool."
