@@ -35,8 +35,8 @@
 
 ### Key features
 
-- **45 tools** covering users, groups, computers, OUs, security, and audit, plus 15 MSP prompt playbooks served through the MCP prompts protocol.
-- **Two transports**: stdio (`server.py`) for direct CLI/desktop clients, and Streamable HTTP via FastAPI (`server_fastapi.py`) for everything else. An earlier FastMCP-based HTTP transport (`server_http.py`) has been removed.
+- **10 tools** covering users, groups, computers, OUs, security and the directory catalogue, plus 15 MSP prompt playbooks served through the MCP prompts protocol. One read-only `search_*` and one write `manage_*` per kind of object; the write tool takes an `action`. Common requests are one call each: an account's details already carry its groups, primary group and OU; onboarding copies groups and OU from a model account (`copy_from_user`); offboarding disables, moves (`move_to_ou`) and optionally strips groups in one call; membership calls accept lists.
+- **Two transports, one catalogue**: stdio (`server.py`) is a thin adapter over the same registry, sanitizer, name resolution and deadlines that serve Streamable HTTP via FastAPI (`server_fastapi.py`). Neither transport can drift from the other. An earlier FastMCP-based HTTP transport (`server_http.py`) has been removed.
 - **Two deployment modes**: `single` (default) binds one process to one AD via `AD_MCP_CONFIG` — run one process per tenant to serve several; `multi` binds one process to N ADs via `AD_MCP_SERVERS`, adding a required/optional `ad_server` parameter to every directory-bound tool. See [Multi-tenant architecture](#multi-tenant-architecture).
 - **Write-operation guard rails**: every mutating tool requires either a per-tenant client confirmation string or an automation Bearer token before touching AD.
 - **Audit log on every operation**: each call records operation name, target, mode (CONFIRMED / AUTOMATION / NO_CONFIRMATION_REQUIRED), and outcome.
@@ -76,7 +76,7 @@ A single `server_fastapi.py` process can instead serve N directories, selected v
 
 - **Write tools**: `ad_server` is required and must name exactly one directory &mdash; there is no "all".
 - **Read tools**: `ad_server` is optional; omitted (or `all`/`todos`/`*`) runs the query against every configured directory and the response reports where each result was found.
-- **Catalog tools**: `ad_list_configured_clients` and `ad_check_client_configuration` are replaced by `ad_list_ad_servers` and `ad_check_ad_server_configured`, which resolve a name, alias, domain or client name to the exact value to pass as `ad_server`. `ad_get_client_tenant_info` still exists but, like every other directory-bound tool, now takes `ad_server` (optional) instead of describing "the" tenant.
+- **Catalog tool**: `ad_list_configured_clients`, `ad_check_client_configuration` and `ad_get_client_tenant_info` are replaced by a single `ad_list_ad_servers`, whose optional `server_name` resolves a name, alias, domain or client name to the exact `ad_server`. Calling it first is not required: `ad_server` itself accepts the client's name.
 
 `ad_server` matching ignores case, accents and surrounding whitespace; a name that matches more than one directory is refused with the list of candidates rather than guessed. Write confirmation (`client_confirmation`, below) is validated against the same directory named by `ad_server`.
 
@@ -164,91 +164,46 @@ claude mcp add --transport http ad http://localhost:8820/mcp \
 
 ## Tools
 
-All tools use the `ad_*` prefix. Tools marked as **Write** require a confirmation string OR an automation Bearer token. The tables below describe `single` mode (the default, 45 tools). In `multi` mode every tool listed here also gets an `ad_server` parameter, and `ad_list_configured_clients` / `ad_check_client_configuration` below are replaced by `ad_list_ad_servers` / `ad_check_ad_server_configured` &mdash; see [Multi-tenant architecture](#multi-tenant-architecture).
+Ten tools: one read-only `ad_search_*` and one write `ad_manage_*` per kind of
+object, plus the catalogue. This is the house pattern (search = discovery,
+manage = action through an `action` parameter) and it replaced the 38 verb-per-
+tool names of before: the catalogue a client has to carry on every call went
+from ~60k to ~23k characters, and a model no longer has to pick between seven
+near-identical user tools.
 
-### Tenant identification (3)
+Every tool declares MCP annotations: `ad_search_*` is `readOnlyHint: true`,
+`ad_manage_*` is `destructiveHint: true` (every one of them includes `delete`).
+In `multi` mode each tool bound to a directory also takes `ad_server`
+(required on writes, optional on reads — omitted means every directory).
 
-| Tool | Operation |
-|---|---|
-| `ad_get_client_tenant_info` | Return tenant info for this instance (call first) |
-| `ad_list_configured_clients` | List all clients registered in the client registry (`single` mode only) |
-| `ad_check_client_configuration` | Check if a given client slug has an AD configured (`single` mode only) |
-
-### User management (9)
-
-| Tool | Write | Operation |
+| Tool | Type | What it does |
 |---|---|---|
-| `ad_list_users_with_filters` | &mdash; | List users (optionally filtered by OU/criteria) |
-| `ad_get_user_details_by_username` | &mdash; | Fetch user attributes by sAMAccountName |
-| `ad_get_user_group_memberships` | &mdash; | List groups a user is member of |
-| `ad_create_user_account` | yes | Create a new user |
-| `ad_modify_user_attributes` | yes | Modify user attributes |
-| `ad_delete_user_account_permanently` | yes | Delete a user |
-| `ad_enable_user_account_access` | yes | Enable user account |
-| `ad_disable_user_account_access` | yes | Disable user account |
-| `ad_reset_user_password_forced` | yes | Reset password (force change on next login) |
+| `ad_search_directory_servers` | read | Configured ADs; `server_name` resolves a client name; `test_connection` runs a live LDAP test (one or all) |
+| `ad_search_directory_users` | read | `username` returns the full account sheet (groups, primary group, OU, flags, manager); otherwise lists by free text, LDAP filter or OU; `inactive_days` lists accounts without logon |
+| `ad_manage_directory_users` | write | `action`: `create` (onboarding; `copy_from_user` copies groups and OU), `update`, `move`, `enable`, `disable` (offboarding with `move_to_ou` and `remove_from_groups`), `reset_password`, `delete` |
+| `ad_search_directory_groups` | read | `group_name` returns the group with its members (`recursive` expands nested groups); otherwise lists |
+| `ad_manage_directory_groups` | write | `action`: `create`, `update`, `move`, `add_members`, `remove_members` (several groups and members per call), `delete` |
+| `ad_search_directory_computers` | read | `computer_name` returns the machine; otherwise lists; `inactive_days` lists stale machines |
+| `ad_manage_directory_computers` | write | `action`: `create`, `update`, `move`, `enable`, `disable`, `reset_trust`, `delete` (a domain controller is refused) |
+| `ad_search_organizational_units` | read | `ou_dn` returns the OU with its GPOs and its contents (`object_types` filters); otherwise lists the hierarchy |
+| `ad_manage_organizational_units` | write | `action`: `create`, `update`, `move`, `delete` (`force` deletes the contents too) |
+| `ad_search_security_reports` | read | `report`: `domain_policy`, `privileged_groups`, `admin_accounts`, `password_violations`, `user_permissions` |
 
-### Group management (8)
+Every write answer is read back from the directory (DN, account state, groups
+actually joined), so a follow-up query to confirm it is unnecessary.
 
-| Tool | Write | Operation |
-|---|---|---|
-| `ad_list_groups_with_filters` | &mdash; | List groups |
-| `ad_get_group_details_by_name` | &mdash; | Fetch group attributes |
-| `ad_get_group_members_recursive` | &mdash; | List members, optionally recursive |
-| `ad_create_group_security_or_distribution` | yes | Create security or distribution group |
-| `ad_modify_group_attributes` | yes | Modify group attributes |
-| `ad_delete_group_permanently` | yes | Delete a group |
-| `ad_add_member_to_group` | yes | Add member |
-| `ad_remove_member_from_group` | yes | Remove member |
+### Old tool names
 
-### Computer management (9)
-
-| Tool | Write | Operation |
-|---|---|---|
-| `ad_list_computers_with_filters` | &mdash; | List computers |
-| `ad_get_computer_details_by_name` | &mdash; | Fetch computer attributes |
-| `ad_get_inactive_computers_by_days` | &mdash; | List computers idle for N+ days |
-| `ad_create_computer_account` | yes | Create computer object |
-| `ad_modify_computer_attributes` | yes | Modify computer attributes |
-| `ad_delete_computer_account_permanently` | yes | Delete computer object |
-| `ad_enable_computer_account_trust` | yes | Enable computer account |
-| `ad_disable_computer_account_trust` | yes | Disable computer account |
-| `ad_reset_computer_password_trust` | yes | Reset computer secure-channel password |
-
-### Organizational Unit management (7)
-
-| Tool | Write | Operation |
-|---|---|---|
-| `ad_list_organizational_units_hierarchy` | &mdash; | List OUs (recursive option) |
-| `ad_get_organizational_unit_details` | &mdash; | Fetch OU attributes |
-| `ad_get_organizational_unit_objects` | &mdash; | List objects inside an OU |
-| `ad_create_organizational_unit` | yes | Create OU |
-| `ad_modify_organizational_unit_attributes` | yes | Modify OU |
-| `ad_delete_organizational_unit_forced` | yes | Delete OU (force=true to delete non-empty) |
-| `ad_move_organizational_unit_parent` | yes | Move OU to a new parent |
-
-### Security & audit (6)
-
-| Tool | Operation |
-|---|---|
-| `ad_get_domain_security_policy_info` | Domain info + password/lockout policy |
-| `ad_get_privileged_security_groups` | List privileged groups (Domain Admins, Enterprise Admins, etc.) |
-| `ad_get_user_effective_permissions` | Show effective permissions for a user |
-| `ad_get_inactive_users_by_days` | Users with no logon for N+ days |
-| `ad_get_password_policy_violations` | Accounts violating the password policy |
-| `ad_audit_administrative_accounts` | Audit privileged account hygiene |
+The 38 names this server listed before are not gone: a client connected
+directly (or a saved prompt) can still call them and is routed to the new tool
+with the right `action` plus a `tool_unificada` note. A gateway that only
+routes listed tools (mcphub) answers "tool not available" instead, and its
+search then finds the new tool. The mapping lives in
+`ALIASES_DE_TOOLS` (`server_fastapi.py`).
 
 ### MSP prompts (15)
 
-The 15 professional MSP playbooks (7 manager + 8 analyst) are **not tools** &mdash; they are served through the standard MCP prompts protocol, `prompts/list` and `prompts/get`, over the FastAPI HTTP transport only (the stdio transport does not expose them). See [PROMPTS.md](PROMPTS.md) for the full catalog and usage.
-
-### System (3)
-
-| Tool | Operation |
-|---|---|
-| `ad_test_ldap_connection_status` | LDAP connectivity probe |
-| `ad_health_check_mcp_server` | Full health check (server + LDAP search test + stats) |
-| `ad_get_mcp_schema_tools_info` | Self-describing schema of all registered tools |
+The 15 professional MSP playbooks (7 manager + 8 analyst) are **not tools** &mdash; they are served through the standard MCP prompts protocol, `prompts/list` and `prompts/get`, over both transports. See [PROMPTS.md](PROMPTS.md) for the full catalog and usage.
 
 ---
 
@@ -292,7 +247,7 @@ Always use a dedicated service account, LDAPS in production, and rotate the pass
 Every mutating tool (`ad_create_*`, `ad_modify_*`, `ad_delete_*`, `ad_enable_*`, `ad_disable_*`, `ad_reset_*`, `ad_add_*`, `ad_remove_*`, `ad_move_*`) calls `check_write_permission()` before reaching LDAP. It accepts the write if **one of**:
 
 1. `automation_token` matches `automation.token` in the config &mdash; intended for CI / scheduled jobs.
-2. `client_confirmation` matches the tenant slug &mdash; the AI assistant must call `ad_get_client_tenant_info` first, read the slug back to the user, and pass that exact string.
+2. `client_confirmation` matches the tenant slug &mdash; the AI assistant must identify the tenant first (`ad_get_client_tenant_info` in single mode, `ad_list_ad_servers` in multi mode), read the slug back to the user, and pass that exact string.
 3. The tenant has `require_confirmation_for_writes: false` (explicit opt-out, not recommended).
 
 If none of the above is satisfied, the call short-circuits with a `permitted: false` message and the LDAP write is never attempted.
@@ -333,7 +288,7 @@ A bundled `docker-compose-ad.yml` spins up a Samba AD container at `192.168.1.10
 | `LDAP bind failed` | bad `bind_dn` / `password` | Verify against `ldapsearch -H <server> -D '<bind_dn>' -W` |
 | `Insufficient permissions` | service account lacks delegated rights | Re-delegate on the target OU |
 | `Certificate verification failed` | self-signed cert without trust | Set `ca_cert_file` or `validate_certificate: false` (test only) |
-| `permitted: false` on every write | Missing confirmation/token | Call `ad_get_client_tenant_info` first, or pass `automation_token` |
+| `permitted: false` on every write | Missing confirmation/token | Identify the tenant first (`ad_get_client_tenant_info` / `ad_list_ad_servers`), or pass `automation_token` |
 | `Health degraded` | socket open but LDAP search failed | Check service-account lockout / replication / network ACLs |
 
 ---

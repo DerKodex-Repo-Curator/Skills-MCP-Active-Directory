@@ -35,7 +35,7 @@ python -m active_directory_mcp.server_fastapi --host 0.0.0.0 --port 8820
 | Config source | `AD_MCP_CONFIG` &rarr; one `ad-config.json` | `AD_MCP_SERVERS` &rarr; one `ad-servers.json` |
 | Directories per process | 1 | N |
 | `ad_server` tool parameter | not present | required on writes, optional on reads |
-| Catalog tools | `ad_get_client_tenant_info`, `ad_list_configured_clients`, `ad_check_client_configuration` | `ad_list_ad_servers`, `ad_check_ad_server_configured` |
+| Catalog tool | `ad_search_directory_servers` | `ad_search_directory_servers` (optional `server_name`; `ad_server` also accepts the client's name directly) |
 | MSP prompts (`prompts/get`) | no `ad_server` argument | `ad_server` in `arguments` selects the directory |
 
 ```bash
@@ -162,12 +162,12 @@ If neither is provided, the call returns `permitted: false` and **no LDAP write 
 # 1. Health check
 curl -X POST http://localhost:8820/mcp \
   -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"ad_health_check_mcp_server","arguments":{}},"id":1}'
+  -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"ad_search_directory_servers","arguments":{"test_connection":true}},"id":1}'
 
 # 2. Tenant identity (single mode)
 curl -X POST http://localhost:8820/mcp \
   -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"ad_get_client_tenant_info","arguments":{}},"id":1}'
+  -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"ad_search_directory_servers","arguments":{}},"id":1}'
 
 # 3. List users
 curl -X POST http://localhost:8820/mcp \
@@ -176,8 +176,8 @@ curl -X POST http://localhost:8820/mcp \
     "jsonrpc": "2.0",
     "method": "tools/call",
     "params": {
-      "name": "ad_list_users_with_filters",
-      "arguments": { "filter_criteria": "(objectClass=user)" }
+      "name": "ad_search_directory_users",
+      "arguments": { "filter_criteria": "(department=Financeiro)" }
     },
     "id": 1
   }'
