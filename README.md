@@ -15,7 +15,7 @@
   <img src="https://img.shields.io/badge/MCP-2024--11--05-blue?style=flat-square" alt="MCP Version"/>
   <img src="https://img.shields.io/badge/Python-3.11+-blue?style=flat-square&logo=python" alt="Python"/>
   <img src="https://img.shields.io/badge/Transport-stdio_|_HTTP-orange?style=flat-square" alt="Transport"/>
-  <img src="https://img.shields.io/badge/Tools-45-brightgreen?style=flat-square" alt="Tools"/>
+  <img src="https://img.shields.io/badge/Tools-10-brightgreen?style=flat-square" alt="Tools"/>
 </p>
 
 <p align="center">
@@ -43,7 +43,7 @@
 
 ### Naming convention
 
-All MCP tool names use the `ad_*` prefix with a descriptive suffix &mdash; e.g. `ad_list_users_with_filters`, `ad_create_user_account`, `ad_disable_computer_account_trust`. This avoids collisions when this MCP runs alongside other servers (GLPI, Hudu, etc.) connected to the same AI client.
+All MCP tool names use the `ad_*` prefix with a descriptive suffix &mdash; e.g. `ad_search_directory_users`, `ad_manage_directory_users`, `ad_search_security_reports`. This avoids collisions when this MCP runs alongside other servers (GLPI, Hudu, etc.) connected to the same AI client.
 
 ---
 
@@ -76,7 +76,7 @@ A single `server_fastapi.py` process can instead serve N directories, selected v
 
 - **Write tools**: `ad_server` is required and must name exactly one directory &mdash; there is no "all".
 - **Read tools**: `ad_server` is optional; omitted (or `all`/`todos`/`*`) runs the query against every configured directory and the response reports where each result was found.
-- **Catalog tool**: `ad_list_configured_clients`, `ad_check_client_configuration` and `ad_get_client_tenant_info` are replaced by a single `ad_list_ad_servers`, whose optional `server_name` resolves a name, alias, domain or client name to the exact `ad_server`. Calling it first is not required: `ad_server` itself accepts the client's name.
+- **Catalog tool**: `ad_list_ad_servers`, `ad_check_ad_server_configured`, `ad_list_configured_clients`, `ad_check_client_configuration` and `ad_get_client_tenant_info` are replaced by a single `ad_search_directory_servers` (same tool in both modes), whose optional `server_name` resolves a name, alias, domain or client name to the exact `ad_server`. Calling it first is not required: `ad_server` itself accepts the client's name.
 
 `ad_server` matching ignores case, accents and surrounding whitespace; a name that matches more than one directory is refused with the list of candidates rather than guessed. Write confirmation (`client_confirmation`, below) is validated against the same directory named by `ad_server`.
 
@@ -166,8 +166,8 @@ claude mcp add --transport http ad http://localhost:8820/mcp \
 
 Ten tools: one read-only `ad_search_*` and one write `ad_manage_*` per kind of
 object, plus the catalogue. This is the house pattern (search = discovery,
-manage = action through an `action` parameter) and it replaced the 38 verb-per-
-tool names of before: the catalogue a client has to carry on every call went
+manage = action through an `action` parameter) and it replaced the 45 verb-per-
+tool names each mode listed before: the catalogue a client has to carry on every call went
 from ~60k to ~23k characters, and a model no longer has to pick between seven
 near-identical user tools.
 
@@ -194,9 +194,12 @@ actually joined), so a follow-up query to confirm it is unnecessary.
 
 ### Old tool names
 
-The 38 names this server listed before are not gone: a client connected
-directly (or a saved prompt) can still call them and is routed to the new tool
-with the right `action` plus a `tool_unificada` note. A gateway that only
+The 45 names this server listed before in each mode (47 distinct names across
+single and multi mode) are not gone: a client connected directly (or a saved
+prompt) can still call them. 45 of them are routed to the new tool with the
+right `action` plus a `tool_unificada` note; `ad_test_ldap_connection_status`
+and `ad_move_organizational_unit_parent` are still registered under their own
+names, just no longer listed. A gateway that only
 routes listed tools (mcphub) answers "tool not available" instead, and its
 search then finds the new tool. The mapping lives in
 `ALIASES_DE_TOOLS` (`server_fastapi.py`).
@@ -225,7 +228,7 @@ The runtime configuration file path is provided via the `AD_MCP_CONFIG` environm
 | `security.validate_certificate` | no | Verify server certificate against `ca_cert_file` |
 | `security.require_secure_connection` | no | Refuse to bind over plaintext |
 | `automation.token` | no | Bearer token for unattended write operations |
-| `client.slug` | no | Tenant identifier reported by `ad_get_client_tenant_info` |
+| `client.slug` | no | Tenant identifier reported by `ad_search_directory_servers` |
 
 ### Service account permissions
 
@@ -244,10 +247,10 @@ Always use a dedicated service account, LDAPS in production, and rotate the pass
 
 ### Write protection model
 
-Every mutating tool (`ad_create_*`, `ad_modify_*`, `ad_delete_*`, `ad_enable_*`, `ad_disable_*`, `ad_reset_*`, `ad_add_*`, `ad_remove_*`, `ad_move_*`) calls `check_write_permission()` before reaching LDAP. It accepts the write if **one of**:
+Every write &mdash; each `action` of the `ad_manage_*` tools, and the old write names routed to them &mdash; calls `check_write_permission()` before reaching LDAP. It accepts the write if **one of**:
 
 1. `automation_token` matches `automation.token` in the config &mdash; intended for CI / scheduled jobs.
-2. `client_confirmation` matches the tenant slug &mdash; the AI assistant must identify the tenant first (`ad_get_client_tenant_info` in single mode, `ad_list_ad_servers` in multi mode), read the slug back to the user, and pass that exact string.
+2. `client_confirmation` matches the tenant slug &mdash; the AI assistant must identify the tenant first (`ad_search_directory_servers`, in either mode), read the slug back to the user, and pass that exact string.
 3. The tenant has `require_confirmation_for_writes: false` (explicit opt-out, not recommended).
 
 If none of the above is satisfied, the call short-circuits with a `permitted: false` message and the LDAP write is never attempted.
@@ -288,7 +291,7 @@ A bundled `docker-compose-ad.yml` spins up a Samba AD container at `192.168.1.10
 | `LDAP bind failed` | bad `bind_dn` / `password` | Verify against `ldapsearch -H <server> -D '<bind_dn>' -W` |
 | `Insufficient permissions` | service account lacks delegated rights | Re-delegate on the target OU |
 | `Certificate verification failed` | self-signed cert without trust | Set `ca_cert_file` or `validate_certificate: false` (test only) |
-| `permitted: false` on every write | Missing confirmation/token | Identify the tenant first (`ad_get_client_tenant_info` / `ad_list_ad_servers`), or pass `automation_token` |
+| `permitted: false` on every write | Missing confirmation/token | Identify the tenant first (`ad_search_directory_servers`), or pass `automation_token` |
 | `Health degraded` | socket open but LDAP search failed | Check service-account lockout / replication / network ACLs |
 
 ---

@@ -149,7 +149,7 @@ server {
 Two layers protect the server:
 
 1. **Transport layer** &mdash; Bearer token in `Authorization: Bearer …`, checked against `AD_MCP_API_TOKEN`. If `AD_MCP_API_TOKEN` is not set in the environment, the FastAPI server accepts every request unauthenticated (`verify_bearer_token` in `server_fastapi.py` treats a missing configured token as "development mode"). Always set `AD_MCP_API_TOKEN` in any environment reachable over the network.
-2. **Tool layer** &mdash; every `ad_create_*` / `ad_modify_*` / `ad_delete_*` / `ad_enable_*` / `ad_disable_*` / `ad_reset_*` / `ad_add_*` / `ad_remove_*` / `ad_move_*` checks one of:
+2. **Tool layer** &mdash; every write (each `action` of the `ad_manage_*` tools, and the old write names routed to them) checks one of:
    - `automation_token` argument equals the tenant's `automation.token`
    - `client_confirmation` argument equals the tenant's `client.slug` (in `multi` mode, the same value accepted by `ad_server`: server name, alias, client name, domain or base DN)
    - `require_confirmation_for_writes: false` in the tenant config
