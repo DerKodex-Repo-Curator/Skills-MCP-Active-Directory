@@ -152,7 +152,7 @@ class ADServerPool:
                     "por conta propria poderia ler ou gravar no AD do cliente errado."
                 ),
                 "servidores_disponiveis": self._short_catalog(),
-                "como_descobrir": "Chame a tool ad_list_ad_servers para ver todos os servidores.",
+                "como_descobrir": "Chame a tool ad_search_directory_servers para ver todos os servidores.",
             }
 
         key, candidates = self._lookup(str(requested))

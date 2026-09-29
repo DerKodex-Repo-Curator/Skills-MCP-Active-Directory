@@ -598,7 +598,7 @@ class ActiveDirectoryMCPFastAPI:
             "Servidor de Active Directory alvo. OBRIGATORIO nesta tool de escrita: "
             "uma alteracao precisa nomear um unico diretorio, e 'todos' nao e aceito. "
             "Aceita o nome do cliente como o usuario falou (ex.: Empresa Alfa), apelido, "
-            "dominio ou slug; nao precisa consultar ad_list_ad_servers antes."
+            "dominio ou slug; nao precisa consultar ad_search_directory_servers antes."
         ),
     }
 
@@ -1004,7 +1004,7 @@ class ActiveDirectoryMCPFastAPI:
                     "Clientes com AD configurado nesta instancia multi-AD. Use o campo "
                     "'slug' no parametro ad_server das demais tools."
                 ),
-                "detalhes": "Chame ad_list_ad_servers para dominio, host, base DN e OUs.",
+                "detalhes": "Chame ad_search_directory_servers para dominio, host, base DN e OUs.",
             }
 
         # Single-AD mode: this process serves exactly one client, and saying
@@ -1630,7 +1630,7 @@ class ActiveDirectoryMCPFastAPI:
                 "mensagem": (
                     f"'ad_server' precisa ser um texto com o nome do servidor; veio "
                     f"{type(bruto_ad_server).__name__} ({bruto_ad_server!r}). "
-                    "Use ad_list_ad_servers para ver os nomes."
+                    "Use ad_search_directory_servers para ver os nomes."
                 ),
                 "tool": tool_name,
             }
