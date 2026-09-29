@@ -6,6 +6,7 @@ import ldap3
 from ldap3 import MODIFY_ADD, MODIFY_DELETE, MODIFY_REPLACE
 
 from .base import BaseTool
+from ..core.resolver import normalizar_dn
 from ..core.logging import log_ldap_operation
 
 
@@ -98,39 +99,43 @@ class GroupTools(BaseTool):
         except Exception as e:
             return self._handle_ldap_error(e, "list_groups", search_base)
     
-    def get_group(self, group_name: str, attributes: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    _LIMITE_MEMBROS = 1000
+
+    def get_group(self, group_name: str, attributes: Optional[List[str]] = None,
+                  recursive: bool = False) -> List[Dict[str, Any]]:
         """
-        Get detailed information about a specific group.
-        
+        A group with its members, by name, login and type, in one answer.
+
+        Members come from one (memberOf=<group>) search instead of the raw
+        'member' DN list; with recursive=True nested groups are expanded (one
+        search per nested group, not per member). This replaces calling
+        details and then a separate member listing.
+
         Args:
             group_name: Group name (sAMAccountName) to search for
             attributes: Specific attributes to retrieve (optional)
-            
+            recursive: also list members of nested groups
+
         Returns:
             List of MCP content objects with group information
         """
         try:
-            # Build search filter
             escaped_group_name = self._escape_ldap_filter(group_name)
             search_filter = f"(&(objectClass=group)(sAMAccountName={escaped_group_name}))"
-            
-            # Determine attributes to retrieve
             if attributes is None:
                 attributes = [
                     'sAMAccountName', 'displayName', 'description', 'mail',
-                    'groupType', 'member', 'memberOf',
-                    'whenCreated', 'whenChanged', 'managedBy', 'info'
+                    'groupType', 'memberOf', 'whenCreated', 'whenChanged', 'managedBy', 'info'
                 ]
-            
+            lidos = list(attributes) + [a for a in ('groupType', 'objectSid', 'memberOf')
+                                        if a not in attributes]
+
             self.logger.info(f"Getting group information for: {group_name}")
-            
-            # Perform search
             results = self.ldap.search(
                 search_base=self.ldap.ad_config.base_dn,
                 search_filter=search_filter,
-                attributes=attributes
+                attributes=lidos
             )
-            
             if not results:
                 log_ldap_operation("get_group", group_name, False, "Group not found")
                 return self._format_response({
@@ -138,29 +143,121 @@ class GroupTools(BaseTool):
                     "error": f"Group '{group_name}' not found",
                     "group_name": group_name
                 }, "get_group")
-            
+
             group_entry = results[0]
-            group_info = {
+            todos = group_entry['attributes']
+            pedidos = {a.lower() for a in attributes}
+            visiveis = {k: v for k, v in todos.items()
+                        if k.lower() in pedidos and k.lower() not in ('member', 'memberof')
+                        and v not in (None, "", [])}
+            membros = self._membros(group_entry['dn'], recursive)
+            group_type = int(self._get_attr(todos, 'groupType', 0) or 0)
+            group_info: Dict[str, Any] = {
                 'dn': group_entry['dn'],
-                'attributes': group_entry['attributes']
+                'attributes': visiveis,
+                'computed': {
+                    'scope': self._get_group_scope(group_type),
+                    'type': self._get_group_type(group_type),
+                    'member_count': len(membros),
+                    'parent_groups_count': len(self._get_attr_list(todos, 'memberOf')),
+                    'ou': self._caminho_da_ou(group_entry['dn']),
+                },
+                'members': membros[:self._LIMITE_MEMBROS],
+                'recursive': recursive,
+                'member_of': [self._nome_do_dn(g) for g in self._get_attr_list(todos, 'memberOf')],
             }
-            
-            # Add computed fields
-            group_type = self._get_attr(group_entry['attributes'], 'groupType', 0)
-            group_info['computed'] = {
-                'scope': self._get_group_scope(group_type),
-                'type': self._get_group_type(group_type),
-                'member_count': len(self._get_attr_list(group_entry['attributes'], 'member')),
-                'parent_groups_count': len(self._get_attr_list(group_entry['attributes'], 'memberOf'))
-            }
-            
+            if len(membros) > self._LIMITE_MEMBROS:
+                group_info['LISTA_CORTADA'] = (
+                    f"O grupo tem {len(membros)} membros; a lista mostra os primeiros "
+                    f"{self._LIMITE_MEMBROS}.")
+            primarios = self._membros_pelo_grupo_primario(todos)
+            if primarios:
+                group_info['computed']['members_by_primary_group'] = primarios
+                group_info['computed']['nota_grupo_primario'] = (
+                    "Estas contas pertencem ao grupo por primaryGroupID (grupo primario) e "
+                    "nao aparecem na lista de membros; o AD nao as grava em 'member'.")
+
             log_ldap_operation("get_group", group_name, True, f"Retrieved group: {group_entry['dn']}")
-            
             return self._format_response(group_info, "get_group")
-            
+
         except Exception as e:
             return self._handle_ldap_error(e, "get_group", group_name)
-    
+
+    def _membros(self, group_dn: str, recursive: bool) -> List[Dict[str, Any]]:
+        """Direct (and, if asked, nested) members, one search per group."""
+        vistos_grupos = {group_dn.lower()}
+        vistos_membros = set()
+        fila = [(group_dn, 0, None)]
+        membros: List[Dict[str, Any]] = []
+        while fila:
+            atual, nivel, via = fila.pop(0)
+            resultados = self.ldap.search(
+                search_base=self.ldap.ad_config.base_dn,
+                search_filter=f"(memberOf={self._escape_ldap_filter(atual)})",
+                attributes=['objectClass', 'sAMAccountName', 'name', 'displayName',
+                            'userAccountControl'])
+            for entrada in resultados:
+                attrs = entrada['attributes']
+                classes = [str(c).lower() for c in self._get_attr_list(attrs, 'objectClass')]
+                tipo = ('computer' if 'computer' in classes else 'user' if 'user' in classes
+                        else 'group' if 'group' in classes else 'contact' if 'contact' in classes
+                        else 'other')
+                chave = entrada['dn'].lower()
+                if chave not in vistos_membros:
+                    vistos_membros.add(chave)
+                    item: Dict[str, Any] = {
+                        'type': tipo,
+                        'name': self._get_attr(attrs, 'name', '') or self._nome_do_dn(entrada['dn']),
+                    }
+                    login = self._get_attr(attrs, 'sAMAccountName', '')
+                    if login and login != item['name']:
+                        item['login'] = login
+                    if tipo in ('user', 'computer'):
+                        uac = self._get_attr(attrs, 'userAccountControl', None)
+                        if uac is not None:
+                            item['enabled'] = not (int(uac) & 0x2)
+                    if recursive:
+                        item['level'] = nivel
+                        if via:
+                            item['via'] = via
+                    item['dn'] = entrada['dn']
+                    membros.append(item)
+                if recursive and tipo == 'group' and chave not in vistos_grupos:
+                    vistos_grupos.add(chave)
+                    fila.append((entrada['dn'], nivel + 1, self._nome_do_dn(entrada['dn'])))
+        membros.sort(key=lambda m: (m.get('level', 0), m['type'], str(m['name']).lower()))
+        return membros
+
+    def _e_grupo_primario_de(self, grupo_attrs: Dict[str, Any], membro_dn: str) -> bool:
+        sid = self._get_attr(grupo_attrs, 'objectSid', None)
+        if not isinstance(sid, str) or not sid.rsplit("-", 1)[-1].isdigit():
+            return False
+        try:
+            achado = self.ldap.search(search_base=membro_dn, search_filter="(objectClass=*)",
+                                      attributes=['primaryGroupID'], search_scope=ldap3.BASE)
+        except Exception:  # noqa: BLE001 - unknown is treated as "not primary"
+            return False
+        if not achado:
+            return False
+        rid = self._get_attr(achado[0]['attributes'], 'primaryGroupID', None)
+        return rid is not None and str(int(rid)) == sid.rsplit("-", 1)[-1]
+
+    def _membros_pelo_grupo_primario(self, attrs: Dict[str, Any]) -> int:
+        """How many accounts use this group as their primary group (e.g. Domain Users)."""
+        sid = self._get_attr(attrs, 'objectSid', None)
+        if not isinstance(sid, str) or not sid.startswith("S-"):
+            return 0
+        rid = sid.rsplit("-", 1)[-1]
+        if not rid.isdigit():
+            return 0
+        try:
+            return len(self.ldap.search(
+                search_base=self.ldap.ad_config.base_dn,
+                search_filter=f"(primaryGroupID={int(rid)})",
+                attributes=['sAMAccountName']))
+        except Exception:  # noqa: BLE001 - a count we could not read is left out
+            return 0
+
     def create_group(self, group_name: str, display_name: Optional[str] = None,
                     description: Optional[str] = None, ou: Optional[str] = None,
                     group_scope: str = "Global", group_type: str = "Security",
@@ -266,7 +363,7 @@ class GroupTools(BaseTool):
             group_results = self.ldap.search(
                 search_base=self.ldap.ad_config.base_dn,
                 search_filter=f"(&(objectClass=group)(sAMAccountName={self._escape_ldap_filter(group_name)}))",
-                attributes=['dn']
+                attributes=['objectClass']
             )
             
             if not group_results:
@@ -323,7 +420,7 @@ class GroupTools(BaseTool):
             group_results = self.ldap.search(
                 search_base=self.ldap.ad_config.base_dn,
                 search_filter=f"(&(objectClass=group)(sAMAccountName={self._escape_ldap_filter(group_name)}))",
-                attributes=['dn']
+                attributes=['objectClass']
             )
             
             if not group_results:
@@ -356,130 +453,136 @@ class GroupTools(BaseTool):
         except Exception as e:
             return self._handle_ldap_error(e, "delete_group", group_name)
     
-    def add_member(self, group_name: str, member_dn: str) -> List[Dict[str, Any]]:
+    def add_member(self, group_name, member_dn) -> List[Dict[str, Any]]:
         """
-        Add a member to a group.
-        
+        Add one or more members to one or more groups.
+
         Args:
-            group_name: Group name to add member to
-            member_dn: Distinguished name of member to add
-            
+            group_name: group login, or a list of them
+            member_dn: member DN, or a list of them
+
         Returns:
             List of MCP content objects with result
         """
-        try:
-            # Find group DN
-            group_results = self.ldap.search(
-                search_base=self.ldap.ad_config.base_dn,
-                search_filter=f"(&(objectClass=group)(sAMAccountName={self._escape_ldap_filter(group_name)}))",
-                attributes=['member']
-            )
-            
-            if not group_results:
-                return self._format_response({
-                    "success": False,
-                    "error": f"Group '{group_name}' not found",
-                    "group_name": group_name
-                }, "add_member")
-            
-            group_dn = group_results[0]['dn']
-            current_members = self._get_attr_list(group_results[0]['attributes'], 'member')
+        return self.alterar_membros(group_name, member_dn, adicionar=True)
 
-            # Check if member is already in group
-            if member_dn in current_members:
-                return self._format_response({
-                    "success": False,
-                    "error": f"Member '{member_dn}' is already in group '{group_name}'",
-                    "group_name": group_name,
-                    "member_dn": member_dn
-                }, "add_member")
-            
-            self.logger.info(f"Adding member {member_dn} to group {group_name}")
-            
-            # Add member to group
-            success = self.ldap.modify(group_dn, {
-                'member': [(MODIFY_ADD, [member_dn])]
-            })
-            
-            if success:
-                log_ldap_operation("add_member", group_dn, True, f"Added member {member_dn} to group {group_name}")
-                
-                return self._success_response(
-                    f"Member added to group '{group_name}' successfully",
-                    {
-                        "group_name": group_name,
-                        "group_dn": group_dn,
-                        "member_dn": member_dn
-                    }
-                )
-            else:
-                raise Exception("Failed to add member to group")
-            
-        except Exception as e:
-            return self._handle_ldap_error(e, "add_member", f"{group_name} -> {member_dn}")
-    
-    def remove_member(self, group_name: str, member_dn: str) -> List[Dict[str, Any]]:
+    def remove_member(self, group_name, member_dn) -> List[Dict[str, Any]]:
         """
-        Remove a member from a group.
-        
+        Remove one or more members from one or more groups.
+
         Args:
-            group_name: Group name to remove member from
-            member_dn: Distinguished name of member to remove
-            
+            group_name: group login, or a list of them
+            member_dn: member DN, or a list of them
+
         Returns:
             List of MCP content objects with result
         """
-        try:
-            # Find group DN
-            group_results = self.ldap.search(
-                search_base=self.ldap.ad_config.base_dn,
-                search_filter=f"(&(objectClass=group)(sAMAccountName={self._escape_ldap_filter(group_name)}))",
-                attributes=['member']
-            )
-            
-            if not group_results:
-                return self._format_response({
-                    "success": False,
-                    "error": f"Group '{group_name}' not found",
-                    "group_name": group_name
-                }, "remove_member")
-            
-            group_dn = group_results[0]['dn']
-            current_members = self._get_attr_list(group_results[0]['attributes'], 'member')
+        return self.alterar_membros(group_name, member_dn, adicionar=False)
 
-            # Check if member is in group
-            if member_dn not in current_members:
-                return self._format_response({
-                    "success": False,
-                    "error": f"Member '{member_dn}' is not in group '{group_name}'",
-                    "group_name": group_name,
-                    "member_dn": member_dn
-                }, "remove_member")
-            
-            self.logger.info(f"Removing member {member_dn} from group {group_name}")
-            
-            # Remove member from group
-            success = self.ldap.modify(group_dn, {
-                'member': [(MODIFY_DELETE, [member_dn])]
-            })
-            
-            if success:
-                log_ldap_operation("remove_member", group_dn, True, f"Removed member {member_dn} from group {group_name}")
-                
-                return self._success_response(
-                    f"Member removed from group '{group_name}' successfully",
-                    {
-                        "group_name": group_name,
-                        "group_dn": group_dn,
-                        "member_dn": member_dn
-                    }
-                )
-            else:
-                raise Exception("Failed to remove member from group")
-            
+    @staticmethod
+    def _como_lista(valor) -> List[str]:
+        if valor is None:
+            return []
+        if isinstance(valor, (list, tuple)):
+            return [str(v) for v in valor if v not in (None, "")]
+        return [str(valor)]
+
+    def alterar_membros(self, grupos, membros, adicionar: bool) -> List[Dict[str, Any]]:
+        """Every group x every member, idempotent, read back per group.
+
+        Already a member (on add) or not a member (on remove) is reported as
+        such, not as an error: repeating a request must not look like a
+        failure. Each group is re-read after its changes, so 'verified' says
+        what the directory holds, not what was sent.
+        """
+        operacao = "add_member" if adicionar else "remove_member"
+        # The same object named twice (login and full name) resolves to the
+        # same DN; sending it twice made AD answer "already exists" and the
+        # call report a failure over a membership that was correct.
+        lista_grupos = list(dict.fromkeys(self._como_lista(grupos)))
+        lista_membros = list({normalizar_dn(m): m for m in self._como_lista(membros)}.values())
+        try:
+            resultados: List[Dict[str, Any]] = []
+            for grupo in lista_grupos:
+                achado = self.ldap.search(
+                    search_base=self.ldap.ad_config.base_dn,
+                    search_filter=f"(&(objectClass=group)"
+                                  f"(sAMAccountName={self._escape_ldap_filter(grupo)}))",
+                    attributes=['member', 'objectSid'])
+                if not achado:
+                    for membro in lista_membros:
+                        resultados.append({"grupo": grupo, "membro": self._nome_do_dn(membro),
+                                           "status": "grupo_nao_encontrado"})
+                    continue
+                group_dn = achado[0]['dn']
+                atuais = {normalizar_dn(m) for m in
+                          self._get_attr_list(achado[0]['attributes'], 'member')}
+                alterados = []
+                for membro in lista_membros:
+                    item = {"grupo": self._nome_do_dn(group_dn), "membro": self._nome_do_dn(membro),
+                            "member_dn": membro, "group_dn": group_dn}
+                    presente = normalizar_dn(membro) in atuais
+                    if adicionar and presente:
+                        item["status"] = "ja_era_membro"
+                    elif not adicionar and not presente:
+                        if self._e_grupo_primario_de(achado[0]['attributes'], membro):
+                            # memberOf never lists the primary group, so this
+                            # used to read as "was not a member" -- while the
+                            # account stayed in it.
+                            item["status"] = "grupo_primario"
+                            item["erro"] = ("Este e o grupo primario da conta (primaryGroupID); "
+                                            "o AD nao deixa retira-la dele. Troque o grupo "
+                                            "primario antes, se for mesmo o caso.")
+                        else:
+                            item["status"] = "nao_era_membro"
+                    else:
+                        try:
+                            self.ldap.modify(group_dn, {
+                                'member': [((MODIFY_ADD if adicionar else MODIFY_DELETE), [membro])]
+                            })
+                            item["status"] = "adicionado" if adicionar else "removido"
+                            alterados.append(item)
+                        except Exception as exc:  # noqa: BLE001 - reported per pair
+                            item["status"] = "falhou"
+                            item["erro"] = str(exc)[:200]
+                    resultados.append(item)
+                if alterados:
+                    relido = self.ldap.search(search_base=group_dn,
+                                              search_filter="(objectClass=group)",
+                                              attributes=['member'], search_scope=ldap3.BASE)
+                    agora = {normalizar_dn(m) for m in
+                             self._get_attr_list(relido[0]['attributes'], 'member')} if relido else set()
+                    for item in alterados:
+                        presente = normalizar_dn(item["member_dn"]) in agora
+                        item["verified"] = bool(relido) and (presente == adicionar)
+                    log_ldap_operation(operacao, group_dn, True,
+                                       f"{len(alterados)} member(s) {'added' if adicionar else 'removed'}")
+
+            contagem: Dict[str, int] = {}
+            for item in resultados:
+                contagem[item["status"]] = contagem.get(item["status"], 0) + 1
+            falhas = [r for r in resultados
+                      if r["status"] in ("falhou", "grupo_nao_encontrado", "grupo_primario")
+                      or r.get("verified") is False]
+            resposta: Dict[str, Any] = {
+                "success": not falhas,
+                "message": (("Membro(s) incluido(s)" if adicionar else "Membro(s) removido(s)")
+                            + ": " + ", ".join(f"{k}: {v}" for k, v in sorted(contagem.items()))),
+                "resumo": contagem,
+                "resultados": resultados,
+            }
+            if len(resultados) == 1:
+                unico = resultados[0]
+                resposta.update({"group_name": unico["grupo"],
+                                 "group_dn": unico.get("group_dn"),
+                                 "member_dn": unico.get("member_dn")})
+            if falhas:
+                resposta["error"] = f"{len(falhas)} alteracao(oes) nao aplicada(s); veja 'resultados'"
+            return self._format_response(resposta, operacao)
+
         except Exception as e:
-            return self._handle_ldap_error(e, "remove_member", f"{group_name} -> {member_dn}")
-    
+            return self._handle_ldap_error(e, operacao, f"{lista_grupos} -> {lista_membros}")
+
     def get_members(self, group_name: str, recursive: bool = False) -> List[Dict[str, Any]]:
         """
         Get members of a group.

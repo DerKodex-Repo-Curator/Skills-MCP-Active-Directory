@@ -319,17 +319,17 @@ Execute uma auditoria de segurança completa do Active Directory:
 
 **ETAPAS DA AUDITORIA:**
 
-1. **Contas Inativas** (use ad_get_inactive_users_by_days)
+1. **Contas Inativas** (use ad_search_directory_users (inactive_days))
    - Identificar usuários sem login há mais de 90 dias
    - Separar contas habilitadas vs desabilitadas
    - {"Incluir contas desabilitadas na análise" if include_disabled else "Focar apenas em contas habilitadas"}
 
-2. **Políticas de Senha** (use ad_get_password_policy_violations)
+2. **Políticas de Senha** (use ad_search_security_reports (report=password_violations))
    - Identificar senhas sem expiração
    - Verificar senhas expiradas não alteradas
    - Listar contas sem requisito de senha complexa
 
-3. **Grupos Privilegiados** (use ad_get_privileged_security_groups)
+3. **Grupos Privilegiados** (use ad_search_security_reports (report=privileged_groups))
    - Auditar membros de Domain Admins
    - Verificar membros de Enterprise Admins
    - Revisar grupos com permissões administrativas
@@ -388,7 +388,7 @@ Analise o crescimento de usuários no Active Directory para planejamento de capa
 
 **ANÁLISE REQUERIDA:**
 
-1. **Listar Todos os Usuários** (use ad_list_users_with_filters)
+1. **Listar Todos os Usuários** (use ad_search_directory_users)
    - Obter todos os usuários com atributo whenCreated
    - Período de análise: últimos {period_months} meses
 
@@ -426,7 +426,7 @@ Período: {datetime.now() - timedelta(days=period_months*30)} até {datetime.now
 - Recursos de infraestrutura: [análise]
 ```
 
-Execute ad_list_users_with_filters e gere a análise.
+Execute ad_search_directory_users e gere a análise.
 """
                 }
             ]
@@ -456,19 +456,19 @@ Verifique compliance das políticas de grupo (GPOs) aplicadas no domínio:
 
 **VERIFICAÇÕES:**
 
-1. **Política de Senha** (use ad_get_domain_security_policy_info)
+1. **Política de Senha** (use ad_search_security_reports (report=domain_policy))
    - Complexidade habilitada: SIM/NÃO
    - Tamanho mínimo: >= 12 caracteres
    - Histórico: >= 24 senhas
    - Idade máxima: <= 90 dias
    - Idade mínima: >= 1 dia
 
-2. **Política de Bloqueio** (use ad_get_domain_security_policy_info)
+2. **Política de Bloqueio** (use ad_search_security_reports (report=domain_policy))
    - Limite de tentativas: <= 5 tentativas
    - Duração do bloqueio: >= 30 minutos
    - Reset do contador: >= 30 minutos
 
-3. **Auditoria de Segurança** (use ad_audit_administrative_accounts)
+3. **Auditoria de Segurança** (use ad_search_security_reports (report=admin_accounts))
    - Auditoria de logon habilitada
    - Auditoria de alterações de conta
    - Auditoria de uso de privilégios
@@ -528,7 +528,7 @@ Execute revisão de acessos privilegiados para compliance SOC2/ISO27001:
 
 **PASSOS:**
 
-1. **Listar Grupos Privilegiados** (use ad_get_privileged_security_groups)
+1. **Listar Grupos Privilegiados** (use ad_search_security_reports (report=privileged_groups))
    - Domain Admins
    - Enterprise Admins
    - Schema Admins
@@ -539,7 +539,7 @@ Execute revisão de acessos privilegiados para compliance SOC2/ISO27001:
    - Print Operators
 
 2. **Para Cada Grupo:**
-   - Listar membros (use ad_get_group_members_recursive)
+   - Listar membros (use ad_search_directory_groups; recursive=true inclui aninhados)
    - Verificar última atividade de cada membro
    - Identificar contas de serviço vs humanas
 
@@ -572,7 +572,7 @@ Filtro: {group_filter}
 - Revisar mensalmente membros de grupos
 ```
 
-Execute ad_get_privileged_security_groups e análise completa.
+Execute ad_search_security_reports (report=privileged_groups) e análise completa.
 """
                 }
             ]
@@ -602,12 +602,12 @@ Analise saúde das políticas de senha e identifique contas em risco:
 
 **ANÁLISE:**
 
-1. **Violações de Política** (use ad_get_password_policy_violations)
+1. **Violações de Política** (use ad_search_security_reports (report=password_violations))
    - Senhas sem expiração
    - Senhas expiradas não alteradas
    - Contas sem requisito de senha
 
-2. **Política do Domínio** (use ad_get_domain_security_policy_info)
+2. **Política do Domínio** (use ad_search_security_reports (report=domain_policy))
    - Requisitos de complexidade
    - Idade máxima/mínima
    - Histórico de senhas
@@ -668,11 +668,11 @@ Gere relatório detalhado de contas inativas para limpeza:
 
 **ANÁLISE:**
 
-1. **Usuários Inativos** (use ad_get_inactive_users_by_days com days={inactive_days})
+1. **Usuários Inativos** (use ad_search_directory_users (inactive_days) com days={inactive_days})
    - Separar por OU/departamento
    - Identificar contas habilitadas vs desabilitadas
 
-2. **Computadores Inativos** (use ad_get_inactive_computers_by_days com days={inactive_days})
+2. **Computadores Inativos** (use ad_search_directory_computers (inactive_days) com days={inactive_days})
    - Listar computadores sem autenticação
    - Identificar computadores órfãos
 
@@ -710,7 +710,7 @@ Fase 2: Mover para OU de quarentena
 Fase 3: Excluir após 30 dias de quarentena
 ```
 
-Execute ad_get_inactive_users_by_days e ad_get_inactive_computers_by_days.
+Execute ad_search_directory_users (inactive_days) e ad_search_directory_computers (inactive_days).
 """
                 }
             ]
@@ -740,12 +740,12 @@ Otimize uso de licenças Microsoft 365 baseado em dados do AD:
 
 **ANÁLISE:**
 
-1. **Inventário de Usuários** (use ad_list_users_with_filters)
+1. **Inventário de Usuários** (use ad_search_directory_users)
    - Total de usuários habilitados
    - Usuários por departamento/OU
 
 2. **Uso Real vs Licenças:**
-   - Usuários inativos com licenças (use ad_get_inactive_users_by_days)
+   - Usuários inativos com licenças (use ad_search_directory_users (inactive_days))
    - Contas de serviço com licenças desnecessárias
    - Licenças subutilizadas
 
@@ -780,7 +780,7 @@ Fase 3: Implementar conversões (30 dias)
 Economia Total Anual: R$ [valor]
 ```
 
-Execute ad_list_users_with_filters e ad_get_inactive_users_by_days para análise.
+Execute ad_search_directory_users e ad_search_directory_users (inactive_days) para análise.
 """
                 }
             ]
@@ -820,9 +820,10 @@ Busque informações essenciais do usuário para atendimento de suporte:
 
 **PASSOS:**
 
-1. **Buscar Usuário** (use ad_get_user_details_by_username ou ad_list_users_with_filters com filtro)
-   - Tentar por username exato
-   - Se não encontrar, buscar por nome ou email parcial
+1. **Buscar Usuário** (use ad_search_directory_users)
+   - Passe o termo como veio: nome completo, parte do nome, login ou e-mail. O
+     servidor localiza a conta; não é preciso descobrir o login antes.
+   - Se a resposta trouxer 'candidatos', escolha pelo login e repita a chamada.
 
 2. **Informações Essenciais:**
    - Nome completo
@@ -833,7 +834,7 @@ Busque informações essenciais do usuário para atendimento de suporte:
    - Bloqueios ativos
 
 3. **Verificações de Segurança:**
-   - Grupos do usuário (use ad_get_user_group_memberships)
+   - Grupos do usuário (já vêm na ficha de ad_search_directory_users)
    - Permissões administrativas
    - Violações de política
 
@@ -865,7 +866,7 @@ Encontrado: SIM/NÃO
 - [Avisos ou problemas detectados]
 ```
 
-Execute ad_get_user_details_by_username("{search_term}") e ad_get_user_group_memberships.
+Execute ad_search_directory_users("{search_term}"): a ficha já traz grupos, grupo primário e OU.
 """
                 }
             ]
@@ -905,13 +906,13 @@ Execute reset de senha do usuário com verificações de segurança:
    - Verificar se solicitante é o próprio usuário
    - Confirmar por canal secundário (telefone/Teams)
 
-2. ✅ **Verificar Status da Conta** (use ad_get_user_details_by_username)
+2. ✅ **Verificar Status da Conta** (use ad_search_directory_users)
    - Confirmar conta existe
    - Verificar se está habilitada
    - Checar bloqueios ativos
 
 3. ✅ **Gerar Senha Temporária**
-   - Usar ad_reset_user_password_forced com force_change=True
+   - Usar ad_manage_directory_users (action=reset_password) com force_change=True
    - Senha será gerada automaticamente
    - Usuário DEVE trocar no próximo login
 
@@ -921,8 +922,8 @@ Execute reset de senha do usuário com verificações de segurança:
 
 **COMANDOS:**
 ```
-1. ad_get_user_details_by_username(username="{username}")
-2. ad_reset_user_password_forced(username="{username}", force_change=True)
+1. ad_search_directory_users(username="{username}")
+2. ad_manage_directory_users (action=reset_password)(username="{username}", force_change=True)
 3. Fornecer senha temporária ao usuário
 ```
 
@@ -952,7 +953,7 @@ Data: {datetime.now().strftime("%Y-%m-%d %H:%M")}
 5. Não reutilizar senhas antigas
 ```
 
-Execute ad_get_user_details_by_username e ad_reset_user_password_forced.
+Execute ad_search_directory_users e ad_manage_directory_users (action=reset_password).
 """
                 }
             ]
@@ -1000,24 +1001,24 @@ Execute onboarding completo de novo usuário {template_info}:
    - Gestor
    - Data de início
 
-2. ✅ **Preparar Grupos** {"(use ad_get_user_group_memberships do template)" if template_user else ""}
+2. ✅ **Preparar Grupos** {"(copy_from_user em ad_manage_directory_users (action=create) copia grupos e OU do template)" if template_user else ""}
    - {"Copiar grupos do usuário template" if template_user else "Aplicar grupos padrão do departamento"}
    - Adicionar grupo do departamento
    - Adicionar grupos de aplicativos necessários
 
-3. ✅ **Criar Conta** (use ad_create_user_account)
+3. ✅ **Criar Conta** (use ad_manage_directory_users (action=create))
    - Username: {username}
    - Senha temporária (complexa)
    - Force password change: SIM
    - OU correta do departamento
 
-4. ✅ **Configurar Grupos** (use ad_add_member_to_group)
+4. ✅ **Configurar Grupos** (use ad_manage_directory_groups (action=add_members))
    - Adicionar aos grupos identificados
    - Verificar permissões aplicadas
 
 5. ✅ **Validação Final**
-   - Confirmar conta criada (use ad_get_user_details_by_username)
-   - Verificar grupos (use ad_get_user_group_memberships)
+   - Confirmar conta criada (use ad_search_directory_users)
+   - Verificar grupos (a resposta de ad_manage_directory_users (action=create) já traz os grupos relidos do AD)
    - Testar autenticação
 
 **FORMATO DE SAÍDA:**
@@ -1057,7 +1058,7 @@ Data: {datetime.now().strftime("%Y-%m-%d")}
 3. Provisionar equipamentos
 ```
 
-{"Execute ad_get_user_group_memberships('"+template_user+"') para copiar configuração." if template_user else "Execute ad_create_user_account com dados coletados."}
+{"Execute ad_manage_directory_users (action=create) com copy_from_user='"+template_user+"': cria a conta, copia grupos e OU e exige troca de senha, numa chamada." if template_user else "Execute ad_manage_directory_users (action=create) com dados coletados."}
 """
                 }
             ]
@@ -1099,12 +1100,12 @@ Execute offboarding seguro e completo do usuário:
    - Emails (exportar mailbox)
    - OneDrive
 
-2. ✅ **Desabilitar Conta** (use ad_disable_user_account_access)
+2. ✅ **Desabilitar Conta** (use ad_manage_directory_users (action=disable))
    - NÃO excluir imediatamente
    - Apenas desabilitar login
    - Manter por 90 dias
 
-3. ✅ **Remover de Grupos** (use ad_get_user_group_memberships + ad_remove_member_from_group)
+3. ✅ **Remover de Grupos** (ad_manage_directory_users (action=disable) com remove_from_groups=true devolve a lista removida)
    - Listar todos os grupos do usuário
    - Remover de TODOS os grupos, exceto "Domain Users"
    - Especial atenção a grupos administrativos
@@ -1168,7 +1169,7 @@ Executado por: [analista]
 - Liberar licenças M365
 ```
 
-Execute ad_get_user_details_by_username, ad_disable_user_account_access, ad_get_user_group_memberships e removals.
+Execute ad_search_directory_users (registra grupos e OU) e ad_manage_directory_users (action=disable) com move_to_ou e, se pedido, remove_from_groups=true: uma chamada faz o desligamento.
 """
                 }
             ]
@@ -1204,7 +1205,7 @@ Verifique detalhadamente os grupos do usuário para troubleshooting:
 
 **ANÁLISE:**
 
-1. **Listar Grupos** (use ad_get_user_group_memberships)
+1. **Listar Grupos** (ficha de ad_search_directory_users)
    - Todos os grupos diretos
    - Grupos aninhados (nested groups)
 
@@ -1254,7 +1255,7 @@ Total de Grupos: [X]
 - [Sugestões de otimização]
 ```
 
-Execute ad_get_user_group_memberships("{username}").
+Execute ad_search_directory_users("{username}"): os grupos estão no bloco resumo.
 """
                 }
             ]
@@ -1290,7 +1291,7 @@ Desbloqueie a conta do usuário com validações de segurança:
 
 **PROCEDIMENTO:**
 
-1. ✅ **Verificar Status** (use ad_get_user_details_by_username)
+1. ✅ **Verificar Status** (use ad_search_directory_users)
    - Confirmar conta está bloqueada
    - Verificar motivo do bloqueio
    - Checar histórico de bloqueios recentes
@@ -1300,9 +1301,9 @@ Desbloqueie a conta do usuário com validações de segurança:
    - Pode ser tentativa de acesso não autorizado
    - Confirmar com usuário antes de desbloquear
 
-3. ✅ **Desbloquear** (use ad_modify_user_attributes para remover lockout)
+3. ✅ **Desbloquear** (use ad_manage_directory_users (action=update) para remover lockout)
    - Nota: AD não tem comando direto unlock via LDAP
-   - Use: ad_modify_user_attributes com atributo lockoutTime = 0
+   - Use: ad_manage_directory_users (action=update) com atributo lockoutTime = 0
 
 4. ✅ **Validação Pós-Unlock**
    - Confirmar conta desbloqueada
@@ -1347,7 +1348,7 @@ Data: {datetime.now().strftime("%Y-%m-%d %H:%M")}
 - Alertar se novo bloqueio
 ```
 
-Execute ad_get_user_details_by_username e ad_modify_user_attributes para unlock.
+Execute ad_search_directory_users e ad_manage_directory_users (action=update) para unlock.
 """
                 }
             ]
@@ -1387,17 +1388,17 @@ Faça troubleshooting de permissões de acesso{resource_info}:
 
 **DIAGNÓSTICO:**
 
-1. ✅ **Verificar Conta** (use ad_get_user_details_by_username)
+1. ✅ **Verificar Conta** (use ad_search_directory_users)
    - Conta habilitada: SIM/NÃO
    - Conta bloqueada: SIM/NÃO
    - Última autenticação: [quando]
 
-2. ✅ **Verificar Grupos** (use ad_get_user_group_memberships)
+2. ✅ **Verificar Grupos** (ficha de ad_search_directory_users)
    - Listar todos os grupos do usuário
    - Identificar grupos com acesso ao recurso
    - Verificar grupos aninhados
 
-3. ✅ **Verificar Permissões Efetivas** (use ad_get_user_effective_permissions)
+3. ✅ **Verificar Permissões Efetivas** (use ad_search_security_reports (report=user_permissions))
    - Permissões via grupos de segurança
    - Permissões diretas (se houver)
    - Permissões negadas (deny sobrepõe allow)
@@ -1454,7 +1455,7 @@ Tempo estimado: [X minutos]
 Requer aprovação: [SIM/NÃO]
 ```
 
-Execute ad_get_user_details_by_username, ad_get_user_group_memberships e ad_get_user_effective_permissions.
+Execute ad_search_directory_users (grupos e OU) e ad_search_security_reports (report=user_permissions).
 """
                 }
             ]
@@ -1496,7 +1497,7 @@ Guie o processo de ingresso do computador no domínio:
    - Porta 389 (LDAP) aberta: OK?
    - Porta 88 (Kerberos) aberta: OK?
 
-2. ✅ **Criar Objeto Computer** (use ad_create_computer_account)
+2. ✅ **Criar Objeto Computer** (use ad_manage_directory_computers (action=create))
    - Nome: {computer_name}
    - OU: [OU de Workstations ou departamento]
    - Descrição: [informações do equipamento]
@@ -1516,7 +1517,7 @@ Add-Computer -DomainName dominio.local -Credential dominio\\admin -Restart
 
 ❌ **Erro: "Nome duplicado na rede"**
 - Causa: Objeto computer já existe
-- Solução: Verificar ad_get_computer_details_by_name("{computer_name}") e ad_delete_computer_account_permanently se órfão
+- Solução: Verificar ad_search_directory_computers("{computer_name}") e ad_manage_directory_computers (action=delete) se órfão
 
 ❌ **Erro: "Não foi possível contatar controlador de domínio"**
 - Causa: Problema DNS ou rede
@@ -1567,12 +1568,12 @@ Data: {datetime.now().strftime("%Y-%m-%d %H:%M")}
 Se erro [X]: [solução específica]
 
 ✅ Validação Final:
-- Computador aparece no AD: (use ad_get_computer_details_by_name)
+- Computador aparece no AD: (use ad_search_directory_computers)
 - Usuário consegue logar: [SIM/NÃO]
 - GPOs sendo aplicadas: gpresult /r
 ```
 
-Execute ad_create_computer_account("{computer_name}") primeiro.
+Execute ad_manage_directory_computers (action=create)("{computer_name}") primeiro.
 """
                 }
             ]

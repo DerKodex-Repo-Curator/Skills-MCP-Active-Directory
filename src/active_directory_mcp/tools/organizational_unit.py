@@ -109,14 +109,21 @@ class OrganizationalUnitTools(BaseTool):
         except Exception as e:
             return self._handle_ldap_error(e, "list_ous", search_base)
     
-    def get_ou(self, ou_dn: str, attributes: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    def get_ou(self, ou_dn: str, attributes: Optional[List[str]] = None,
+               object_types: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         """
-        Get detailed information about a specific Organizational Unit.
-        
+        Get an Organizational Unit together with what it contains.
+
+        The OU's attributes and its direct children come back in one answer:
+        measured 2026-09-19, a model checking a move called details and
+        contents of the same two OUs in pairs, six rounds in a row.
+
         Args:
             ou_dn: Distinguished name of the OU
             attributes: Specific attributes to retrieve (optional)
-            
+            object_types: Which children to list (user, group, computer,
+                organizationalUnit); None lists all of them
+
         Returns:
             List of MCP content objects with OU information
         """
@@ -158,20 +165,29 @@ class OrganizationalUnitTools(BaseTool):
             ou_entry = results[0]
             ou_info = {
                 'dn': ou_entry['dn'],
-                'attributes': ou_entry['attributes']
+                # Null attributes carried no information and cost tokens.
+                'attributes': {k: v for k, v in ou_entry['attributes'].items()
+                               if v not in (None, "", [])}
             }
             
-            # Add computed fields
+            # One LEVEL search answers both the counts and the listing; it
+            # used to take two extra searches just to count.
+            todos = self._listar_conteudo(ou_dn, None)
+            conteudo = self._listar_conteudo(ou_dn, object_types) \
+                if object_types else todos
             ou_info['computed'] = {
-                'child_objects_count': self._count_child_objects(ou_dn),
-                'sub_ous_count': self._count_sub_ous(ou_dn),
+                'child_objects_count': len(todos),
+                'sub_ous_count': sum(1 for o in todos if o['type'] == 'organizationalUnit'),
                 'level': self._calculate_ou_level(ou_dn, self.ldap.ad_config.base_dn)
             }
-            
-            # Parse GP Links if present
-            gp_link = ou_entry['attributes'].get('gPLink', [])
+
+            # gPLink is single-valued: ldap3 hands back a str, and the old
+            # gp_link[0] parsed its FIRST CHARACTER, so no GPO was ever listed.
+            gp_link = self._get_attr(ou_entry['attributes'], 'gPLink', '')
             if gp_link:
-                ou_info['computed']['linked_gpos'] = self._parse_gp_link(gp_link[0])
+                ou_info['computed']['linked_gpos'] = self._parse_gp_link(str(gp_link))
+
+            ou_info.update(self._resumo_do_conteudo(conteudo, object_types))
             
             log_ldap_operation("get_ou", ou_dn, True, f"Retrieved OU: {ou_dn}")
             
@@ -400,183 +416,265 @@ class OrganizationalUnitTools(BaseTool):
     def move_ou(self, ou_dn: str, new_parent_dn: str) -> List[Dict[str, Any]]:
         """
         Move an OU to a new parent.
-        
+
         Args:
             ou_dn: OU distinguished name to move
             new_parent_dn: New parent OU distinguished name
-            
+
         Returns:
             List of MCP content objects with result
         """
+        return self.move_object(ou_dn, new_parent_dn, only_ou=True)
+
+    def move_object(self, object_dn: str, new_parent_dn: str,
+                    only_ou: bool = False) -> List[Dict[str, Any]]:
+        """
+        Move a user, computer, group or OU under another OU or container.
+
+        The new DN in the answer is read back from the directory after the
+        move, not computed: the previous version built it from name[0], which
+        on a single-valued string is its FIRST LETTER ("OU=T,..." for "TI").
+
+        Args:
+            object_dn: DN of the object to move
+            new_parent_dn: DN of the destination OU, container or domain root
+            only_ou: refuse anything that is not an OU (the legacy move_ou)
+
+        Returns:
+            List of MCP content objects with result
+        """
+        operacao = "move_ou" if only_ou else "move_object"
         try:
-            # Validate DNs
-            if not self._validate_dn(ou_dn) or not self._validate_dn(new_parent_dn):
+            if not self._validate_dn(object_dn) or not self._validate_dn(new_parent_dn):
                 return self._format_response({
                     "success": False,
                     "error": "Invalid DN format",
-                    "ou_dn": ou_dn,
+                    "object_dn": object_dn,
                     "new_parent_dn": new_parent_dn
-                }, "move_ou")
-            
-            # Check if OU exists
-            existing_ou = self.ldap.search(
-                search_base=ou_dn,
-                search_filter="(objectClass=organizationalUnit)",
-                attributes=['name'],
+                }, operacao)
+
+            origem = self.ldap.search(
+                search_base=object_dn,
+                search_filter="(objectClass=*)",
+                attributes=['objectClass', 'name'],
                 search_scope=ldap3.BASE
             )
-            
-            if not existing_ou:
+            if not origem:
                 return self._format_response({
                     "success": False,
-                    "error": f"OU not found: {ou_dn}",
-                    "ou_dn": ou_dn
-                }, "move_ou")
-            
-            # Check if new parent exists
-            parent_exists = self.ldap.search(
+                    "error": f"Object not found: {object_dn}",
+                    "object_dn": object_dn
+                }, operacao)
+            classes = origem[0]['attributes'].get('objectClass') or []
+            if isinstance(classes, str):
+                classes = [classes]
+            tipo = self._detect_object_type([str(c) for c in classes])
+            if only_ou and tipo != 'organizational_unit':
+                return self._format_response({
+                    "success": False,
+                    "error": f"OU not found: {object_dn}",
+                    "ou_dn": object_dn
+                }, operacao)
+
+            destino = self.ldap.search(
                 search_base=new_parent_dn,
-                search_filter="(|(objectClass=organizationalUnit)(objectClass=domain))",
+                search_filter="(|(objectClass=organizationalUnit)(objectClass=container)"
+                              "(objectClass=domain))",
                 attributes=['name'],
                 search_scope=ldap3.BASE
             )
-            
-            if not parent_exists:
+            if not destino:
                 return self._format_response({
                     "success": False,
                     "error": f"Parent OU not found: {new_parent_dn}",
                     "new_parent_dn": new_parent_dn
-                }, "move_ou")
-            
-            self.logger.info(f"Moving OU {ou_dn} to {new_parent_dn}")
-            
-            # Move OU
-            success = self.ldap.move(ou_dn, new_parent_dn)
-            
-            if success:
-                # Calculate new DN
-                ou_name = existing_ou[0]['attributes']['name'][0]
-                new_dn = f"OU={ou_name},{new_parent_dn}"
-                
-                log_ldap_operation("move_ou", ou_dn, True, f"Moved OU to: {new_dn}")
-                
+                }, operacao)
+
+            partes = self._split_dn(object_dn)
+            origem_n = self._dn_normalizado(object_dn)
+            destino_n = self._dn_normalizado(new_parent_dn)
+            if destino_n == origem_n or destino_n.endswith("," + origem_n):
+                return self._format_response({
+                    "success": False,
+                    "error": "An object cannot be moved into itself or into one of its "
+                             "own sub-OUs",
+                    "object_dn": object_dn,
+                    "new_parent_dn": new_parent_dn
+                }, operacao)
+            if self._dn_normalizado(",".join(partes[1:])) == destino_n:
                 return self._success_response(
-                    f"OU moved successfully",
-                    {
-                        "old_dn": ou_dn,
-                        "new_dn": new_dn,
-                        "new_parent_dn": new_parent_dn
-                    }
-                )
-            else:
-                raise Exception("Failed to move OU")
-            
+                    "Object is already in the requested OU; nothing was changed",
+                    {"old_dn": object_dn, "new_dn": object_dn,
+                     "new_parent_dn": new_parent_dn, "object_type": tipo,
+                     "verified": True, "changed": False})
+
+            self.logger.info(f"Moving {tipo} {object_dn} to {new_parent_dn}")
+            self.ldap.move(object_dn, new_parent_dn)
+
+            novo_dn = f"{partes[0]},{new_parent_dn}"
+            relido = self.ldap.search(
+                search_base=novo_dn,
+                search_filter="(objectClass=*)",
+                attributes=['name'],
+                search_scope=ldap3.BASE
+            )
+            verificado = bool(relido)
+            if verificado:
+                novo_dn = relido[0].get('dn') or novo_dn
+            log_ldap_operation(operacao, object_dn, True, f"Moved to: {novo_dn}")
+            return self._success_response(
+                f"{tipo} moved successfully" if verificado else
+                f"{tipo} move was accepted but the new DN could not be read back",
+                {
+                    "old_dn": object_dn,
+                    "new_dn": novo_dn,
+                    "new_parent_dn": new_parent_dn,
+                    "object_type": tipo,
+                    "verified": verificado,
+                    "changed": True,
+                }
+            )
+
         except Exception as e:
-            return self._handle_ldap_error(e, "move_ou", ou_dn)
-    
+            return self._handle_ldap_error(e, operacao, object_dn)
+
+    @classmethod
+    def _dn_normalizado(cls, dn: str) -> str:
+        """Compare DNs by component. Removing every space made OU "A B" equal
+        to its sibling "AB": a move between them answered "already there"."""
+        partes = []
+        for rdn in cls._split_dn(dn):
+            chave, _, valor = rdn.partition("=")
+            partes.append(f"{chave.strip().lower()}={valor.strip().lower()}")
+        return ",".join(partes)
+
+    @staticmethod
+    def _split_dn(dn: str) -> List[str]:
+        """Split a DN on unescaped commas."""
+        partes, atual, escapado = [], [], False
+        for c in str(dn):
+            if escapado:
+                atual.append(c)
+                escapado = False
+            elif c == "\\":
+                atual.append(c)
+                escapado = True
+            elif c == ",":
+                partes.append("".join(atual).strip())
+                atual = []
+            else:
+                atual.append(c)
+        partes.append("".join(atual).strip())
+        return [p for p in partes if p]
+
+    # Above this many children the listing is cut and says so.
+    _LIMITE_CONTEUDO = 500
+
     def get_ou_contents(self, ou_dn: str, object_types: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         """
         Get contents of an OU (users, groups, computers, sub-OUs).
-        
+
         Args:
             ou_dn: OU distinguished name
             object_types: Types of objects to include (optional: user, group, computer, organizationalUnit)
-            
+
         Returns:
             List of MCP content objects with OU contents
         """
         try:
-            # Validate DN
             if not self._validate_dn(ou_dn):
                 return self._format_response({
                     "success": False,
                     "error": f"Invalid DN format: {ou_dn}",
                     "ou_dn": ou_dn
                 }, "get_ou_contents")
-            
-            # Default object types
-            if object_types is None:
-                object_types = ['user', 'group', 'computer', 'organizationalUnit']
-            
-            # Build search filter
-            filter_parts = []
-            if 'user' in object_types:
-                filter_parts.append("(objectClass=user)")
-            if 'group' in object_types:
-                filter_parts.append("(objectClass=group)")
-            if 'computer' in object_types:
-                filter_parts.append("(objectClass=computer)")
-            if 'organizationalUnit' in object_types:
-                filter_parts.append("(objectClass=organizationalUnit)")
-            
-            if not filter_parts:
-                return self._format_response({
-                    "success": False,
-                    "error": "No valid object types specified",
-                    "ou_dn": ou_dn
-                }, "get_ou_contents")
-            
-            search_filter = f"(|{''.join(filter_parts)})"
-            
-            self.logger.info(f"Getting contents of OU: {ou_dn}")
-            
-            # Perform search
-            results = self.ldap.search(
-                search_base=ou_dn,
-                search_filter=search_filter,
-                attributes=['objectClass', 'sAMAccountName', 'name', 'displayName', 'description'],
-                search_scope=1  # ONELEVEL equivalent
-            )
-            
-            # Process results
-            contents = []
-            for entry in results:
-                object_classes = entry['attributes'].get('objectClass', [])
-                
-                # Determine object type
-                if 'user' in object_classes and 'computer' not in object_classes:
-                    obj_type = 'user'
-                elif 'group' in object_classes:
-                    obj_type = 'group'
-                elif 'computer' in object_classes:
-                    obj_type = 'computer'
-                elif 'organizationalUnit' in object_classes:
-                    obj_type = 'organizationalUnit'
-                else:
-                    obj_type = 'unknown'
-                
-                content_info = {
-                    'dn': entry['dn'],
-                    'type': obj_type,
-                    'name': self._get_attr(entry['attributes'], 'name', '') or self._get_attr(entry['attributes'], 'sAMAccountName', ''),
-                    'displayName': self._get_attr(entry['attributes'], 'displayName', ''),
-                    'description': self._get_attr(entry['attributes'], 'description', '')
-                }
-                
-                contents.append(content_info)
-            
-            # Sort by type and name
-            contents.sort(key=lambda x: (x['type'], x['name']))
-            
-            log_ldap_operation("get_ou_contents", ou_dn, True, f"Retrieved {len(contents)} objects")
-            
-            # Count by type
-            type_counts = {}
-            for obj in contents:
-                obj_type = obj['type']
-                type_counts[obj_type] = type_counts.get(obj_type, 0) + 1
-            
-            return self._format_response({
-                "ou_dn": ou_dn,
-                "contents": contents,
-                "total_count": len(contents),
-                "type_counts": type_counts,
-                "object_types": object_types
-            }, "get_ou_contents")
-            
+            conteudo = self._listar_conteudo(ou_dn, object_types)
+            log_ldap_operation("get_ou_contents", ou_dn, True,
+                               f"Retrieved {len(conteudo)} objects")
+            return self._format_response(
+                {"ou_dn": ou_dn, **self._resumo_do_conteudo(conteudo, object_types)},
+                "get_ou_contents")
         except Exception as e:
             return self._handle_ldap_error(e, "get_ou_contents", ou_dn)
-    
+
+    _FILTRO_POR_TIPO = {
+        'user': "(&(objectCategory=person)(objectClass=user))",
+        'group': "(objectClass=group)",
+        'computer': "(objectClass=computer)",
+        'organizationalUnit': "(objectClass=organizationalUnit)",
+    }
+
+    def _listar_conteudo(self, ou_dn: str,
+                         object_types: Optional[List[str]]) -> List[Dict[str, Any]]:
+        """Direct children of an OU, one LEVEL search, sorted by type and name.
+
+        Raises ValueError for an unknown type instead of silently listing
+        nothing: an empty answer would read as "this OU is empty".
+        """
+        tipos = list(object_types) if object_types else list(self._FILTRO_POR_TIPO)
+        desconhecidos = [t for t in tipos if t not in self._FILTRO_POR_TIPO]
+        if desconhecidos:
+            raise ValueError(
+                f"object_types desconhecido(s): {desconhecidos}. Valores aceitos: "
+                f"{', '.join(self._FILTRO_POR_TIPO)}.")
+        filtro = "(|" + "".join(self._FILTRO_POR_TIPO[t] for t in tipos) + ")"
+        resultados = self.ldap.search(
+            search_base=ou_dn,
+            search_filter=filtro,
+            attributes=['objectClass', 'sAMAccountName', 'name', 'displayName',
+                        'description', 'userAccountControl'],
+            search_scope=ldap3.LEVEL
+        )
+        conteudo = []
+        for entry in resultados:
+            attrs = entry['attributes']
+            classes = [str(c).lower() for c in self._get_attr_list(attrs, 'objectClass')]
+            if 'computer' in classes:
+                tipo = 'computer'
+            elif 'user' in classes:
+                tipo = 'user'
+            elif 'group' in classes:
+                tipo = 'group'
+            elif 'organizationalunit' in classes:
+                tipo = 'organizationalUnit'
+            else:
+                tipo = 'unknown'
+            item = {
+                'type': tipo,
+                'name': self._get_attr(attrs, 'name', '') or self._get_attr(attrs, 'sAMAccountName', ''),
+                'dn': entry['dn'],
+            }
+            for chave, atributo in (('login', 'sAMAccountName'), ('displayName', 'displayName'),
+                                    ('description', 'description')):
+                valor = self._get_attr(attrs, atributo, '')
+                if valor and valor != item['name']:
+                    item[chave] = valor
+            if tipo in ('user', 'computer'):
+                uac = self._get_attr(attrs, 'userAccountControl', None)
+                if uac is not None:
+                    item['enabled'] = not (int(uac) & 0x2)
+            conteudo.append(item)
+        conteudo.sort(key=lambda x: (x['type'], str(x['name']).lower()))
+        return conteudo
+
+    def _resumo_do_conteudo(self, conteudo: List[Dict[str, Any]],
+                            object_types: Optional[List[str]]) -> Dict[str, Any]:
+        type_counts: Dict[str, int] = {}
+        for obj in conteudo:
+            type_counts[obj['type']] = type_counts.get(obj['type'], 0) + 1
+        resumo = {
+            "contents": conteudo[:self._LIMITE_CONTEUDO],
+            "total_count": len(conteudo),
+            "type_counts": type_counts,
+            "object_types": object_types or list(self._FILTRO_POR_TIPO),
+        }
+        if len(conteudo) > self._LIMITE_CONTEUDO:
+            resumo["LISTA_CORTADA"] = (
+                f"A OU tem {len(conteudo)} objetos diretos; a lista mostra os primeiros "
+                f"{self._LIMITE_CONTEUDO} (por tipo e nome). Filtre com object_types ou "
+                "consulte uma sub-OU.")
+        return resumo
+
     def _calculate_ou_level(self, ou_dn: str, base_dn: str) -> int:
         """Calculate the level of an OU relative to base DN."""
         try:
@@ -597,8 +695,8 @@ class OrganizationalUnitTools(BaseTool):
             results = self.ldap.search(
                 search_base=ou_dn,
                 search_filter="(objectClass=*)",
-                attributes=['dn'],
-                search_scope=1  # ONELEVEL equivalent
+                attributes=['objectClass'],
+                search_scope=ldap3.LEVEL  # ONELEVEL equivalent
             )
             return len(results)
         except:
@@ -610,8 +708,8 @@ class OrganizationalUnitTools(BaseTool):
             results = self.ldap.search(
                 search_base=ou_dn,
                 search_filter="(objectClass=organizationalUnit)",
-                attributes=['dn'],
-                search_scope=1  # ONELEVEL equivalent
+                attributes=['objectClass'],
+                search_scope=ldap3.LEVEL  # ONELEVEL equivalent
             )
             return len(results)
         except:
@@ -654,7 +752,7 @@ class OrganizationalUnitTools(BaseTool):
                 search_base=ou_dn,
                 search_filter="(objectClass=*)",
                 attributes=['objectClass'],
-                search_scope=1  # ONELEVEL equivalent
+                search_scope=ldap3.LEVEL  # ONELEVEL equivalent
             )
             
             # Delete in reverse order (deepest first)

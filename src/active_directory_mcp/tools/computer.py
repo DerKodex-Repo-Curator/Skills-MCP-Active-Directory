@@ -289,7 +289,7 @@ class ComputerTools(BaseTool):
             computer_results = self.ldap.search(
                 search_base=self.ldap.ad_config.base_dn,
                 search_filter=f"(&(objectClass=computer)(sAMAccountName={self._escape_ldap_filter(computer_name)}))",
-                attributes=['dn']
+                attributes=['objectClass']
             )
             
             if not computer_results:
@@ -350,7 +350,7 @@ class ComputerTools(BaseTool):
             computer_results = self.ldap.search(
                 search_base=self.ldap.ad_config.base_dn,
                 search_filter=f"(&(objectClass=computer)(sAMAccountName={self._escape_ldap_filter(computer_name)}))",
-                attributes=['dn']
+                attributes=['userAccountControl']
             )
             
             if not computer_results:
@@ -361,6 +361,10 @@ class ComputerTools(BaseTool):
                 }, "delete_computer")
             
             computer_dn = computer_results[0]['dn']
+            recusa = self._recusa_se_dc(computer_results[0]['attributes'], computer_name,
+                                        computer_dn, "delete_computer")
+            if recusa is not None:
+                return recusa
             
             self.logger.info(f"Deleting computer: {computer_name} ({computer_dn})")
             
@@ -426,7 +430,7 @@ class ComputerTools(BaseTool):
             computer_results = self.ldap.search(
                 search_base=self.ldap.ad_config.base_dn,
                 search_filter=f"(&(objectClass=computer)(sAMAccountName={self._escape_ldap_filter(computer_name)}))",
-                attributes=['dn']
+                attributes=['userAccountControl']
             )
             
             if not computer_results:
@@ -437,31 +441,39 @@ class ComputerTools(BaseTool):
                 }, "reset_computer_password")
             
             computer_dn = computer_results[0]['dn']
+            recusa = self._recusa_se_dc(computer_results[0]['attributes'], computer_name,
+                                        computer_dn, "reset_computer_password")
+            if recusa is not None:
+                return recusa
             
             self.logger.info(f"Resetting password for computer: {computer_name}")
-            
-            # Generate new computer password (computers use complex passwords)
-            new_password = self._generate_computer_password()
-            
-            # Reset password (set pwdLastSet to 0 to force password change)
-            success = self.ldap.modify(computer_dn, {
-                'pwdLastSet': [(MODIFY_REPLACE, [0])]
+
+            # The old version only zeroed pwdLastSet and answered with a random
+            # password that was never written. ADUC's "Reset Account" writes a
+            # GUESSABLE default (the lowercase name); the audit of 2026-09-19
+            # flagged that as a window in which anyone could log on as the
+            # machine. A strong random password, written and never returned,
+            # gives the same result: the secure channel is reset and the
+            # machine repairs it from its side.
+            nova = self._generate_computer_password()
+            self.ldap.modify(computer_dn, {
+                'unicodePwd': [(MODIFY_REPLACE, [f'"{nova}"'.encode('utf-16-le')])]
             })
-            
-            if success:
-                log_ldap_operation("reset_computer_password", computer_dn, True, f"Reset password for: {computer_name}")
-                
-                return self._success_response(
-                    f"password reset successfully for computer '{computer_name}'",
-                    {
-                        "computer_name": computer_name,
-                        "dn": computer_dn,
-                        "new_password": new_password
-                    }
-                )
-            else:
-                raise Exception("Failed to reset computer password")
-            
+            log_ldap_operation("reset_computer_password", computer_dn, True,
+                               f"Reset account for: {computer_name}")
+            return self._success_response(
+                f"Computer account '{computer_name}' reset (new random password written, "
+                "not returned)",
+                {
+                    "computer_name": computer_name,
+                    "dn": computer_dn,
+                    "next_step": (
+                        "A maquina precisa restabelecer a confianca: reingresse-a no dominio, ou "
+                        "rode nela, como administrador, Test-ComputerSecureChannel -Repair "
+                        "-Credential <conta do dominio>. Ate isso, logons de dominio nela falham."),
+                }
+            )
+
         except Exception as e:
             return self._handle_ldap_error(e, "reset_computer_password", computer_name)
     
@@ -528,51 +540,88 @@ class ComputerTools(BaseTool):
         except Exception as e:
             return self._handle_ldap_error(e, "get_stale_computers", self.ldap.ad_config.base_dn)
     
+    _SERVER_TRUST_ACCOUNT = 0x2000   # domain controller
+    _PARTIAL_SECRETS_ACCOUNT = 0x4000000   # read-only domain controller
+
+    def _recusa_se_dc(self, attrs: Dict[str, Any], computer_name: str, dn: str,
+                      operation: str) -> Optional[List[Dict[str, Any]]]:
+        """Refuse account-level changes on a domain controller.
+
+        Disabling, deleting or resetting a DC's machine account from here
+        breaks replication and logons for the whole domain; that work is a
+        demotion, not a tool call (audit 2026-09-19).
+        """
+        uac = int(self._get_attr(attrs, 'userAccountControl', 0) or 0)
+        if uac & (self._SERVER_TRUST_ACCOUNT | self._PARTIAL_SECRETS_ACCOUNT):
+            return self._format_response({
+                "success": False,
+                "error": (f"'{computer_name}' e um controlador de dominio. Desativar, apagar ou "
+                          "redefinir a conta dele por aqui derruba replicacao e logons do dominio; "
+                          "isso se faz rebaixando o DC, nao por esta tool. Nada foi alterado."),
+                "computer_name": computer_name, "dn": dn,
+            }, operation)
+        return None
+
     def _set_computer_account_control(self, computer_name: str, uac_value: int, operation: str) -> List[Dict[str, Any]]:
-        """Set computer account control value."""
+        """Flip only ACCOUNTDISABLE on a computer account.
+
+        @MX:WARN The old version REPLACED userAccountControl with 4096/4098:
+        a server lost TRUSTED_FOR_DELEGATION (0x80000), a DC its
+        SERVER_TRUST_ACCOUNT bit. uac_value now only says which way to flip
+        (4098 = disable, anything else = enable).
+        @MX:REASON Measured 2026-09-19: the same family was fixed on users;
+        the computer path had its own copy of the defect.
+        """
+        desativar = bool(uac_value & 0x2)
         try:
-            # Normalize computer name
             if not computer_name.endswith('$'):
                 computer_name += '$'
-            
-            # Find computer DN
             computer_results = self.ldap.search(
                 search_base=self.ldap.ad_config.base_dn,
                 search_filter=f"(&(objectClass=computer)(sAMAccountName={self._escape_ldap_filter(computer_name)}))",
-                attributes=['dn']
+                attributes=['userAccountControl']
             )
-            
             if not computer_results:
                 return self._format_response({
                     "success": False,
                     "error": f"Computer '{computer_name}' not found",
                     "computer_name": computer_name
                 }, operation)
-            
+
             computer_dn = computer_results[0]['dn']
-            
-            # Modify userAccountControl
-            success = self.ldap.modify(computer_dn, {
-                'userAccountControl': [(MODIFY_REPLACE, [uac_value])]
-            })
-            
-            if success:
-                log_ldap_operation(operation, computer_dn, True, f"{operation.capitalize()}d computer: {computer_name}")
-                
-                return self._success_response(
-                    f"Computer '{computer_name}' {operation}d successfully",
-                    {
-                        "computer_name": computer_name,
-                        "dn": computer_dn,
-                        "userAccountControl": uac_value
-                    }
-                )
-            else:
-                raise Exception(f"Failed to {operation} computer")
-            
+            lido = self._get_attr(computer_results[0]['attributes'], 'userAccountControl', None)
+            if lido in (None, "", []):
+                return self._format_response({
+                    "success": False,
+                    "error": "userAccountControl could not be read; nothing was changed",
+                    "computer_name": computer_name, "dn": computer_dn,
+                }, operation)
+            if desativar:
+                recusa = self._recusa_se_dc(computer_results[0]['attributes'], computer_name,
+                                            computer_dn, operation)
+                if recusa is not None:
+                    return recusa
+            antes = int(lido)
+            depois = (antes | 0x2) if desativar else (antes & ~0x2)
+            if depois != antes:
+                self.ldap.modify(computer_dn, {
+                    'userAccountControl': [(MODIFY_REPLACE, [depois])]
+                })
+            log_ldap_operation(operation, computer_dn, True,
+                               f"{operation.capitalize()}d computer: {computer_name}")
+            return self._success_response(
+                f"Computer '{computer_name}' {operation}d successfully"
+                + ("" if depois != antes else " (already in that state; nothing written)"),
+                {
+                    "computer_name": computer_name,
+                    "dn": computer_dn,
+                    "userAccountControl": depois,
+                    "changed": depois != antes,
+                }
+            )
         except Exception as e:
             return self._handle_ldap_error(e, operation, computer_name)
-    
+
     def _is_computer_enabled(self, uac_value: int) -> bool:
         """Check if computer account is enabled based on userAccountControl."""
         return not bool(uac_value & 0x0002)  # Check ACCOUNTDISABLE flag

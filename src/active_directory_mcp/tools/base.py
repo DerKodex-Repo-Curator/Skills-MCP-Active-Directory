@@ -1,6 +1,7 @@
 """Base class for Active Directory tools."""
 
 import json
+import re
 from typing import List, Dict, Any, Optional
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, timezone
@@ -8,7 +9,10 @@ from datetime import datetime, timedelta, timezone
 from mcp.types import TextContent as Content
 from ldap3.core.exceptions import LDAPException
 
+import ldap3
+
 from ..core.ldap_manager import LDAPManager
+from ..core.resolver import caminho_legivel, dividir_dn, normalizar_dn
 from ..core.logging import get_logger, log_ldap_operation
 
 
@@ -80,7 +84,9 @@ class BaseTool(ABC):
         Returns:
             List of MCP content objects with error information
         """
-        error_msg = str(e)
+        # An exception with an empty str() used to reach the client as an empty
+        # error; the class name at least says what kind of failure it was.
+        error_msg = str(e) or type(e).__name__
         
         if isinstance(e, LDAPException):
             self.logger.error(f"LDAP error during {operation}: {error_msg}")
@@ -116,8 +122,10 @@ class BaseTool(ABC):
         if not dn or not isinstance(dn, str):
             return False
         
-        # Basic DN validation - should contain at least one component
-        dn_parts = dn.split(',')
+        # Basic DN validation - should contain at least one component. Split on
+        # UNESCAPED commas only: "CN=Silva\, Joao,OU=x" is one RDN plus one,
+        # and a plain split rejected every "Surname, Name" account as malformed.
+        dn_parts = re.split(r'(?<!\\),', dn)
         for part in dn_parts:
             part = part.strip()
             if '=' not in part:
@@ -301,3 +309,126 @@ class BaseTool(ABC):
         if isinstance(value, list):
             return value
         return [value]
+
+    # ------------------------------------------------ shared building blocks
+    # Several tools answer with the same pieces (the groups of an account, the
+    # OU it lives in, a move read back from the directory). They are built
+    # here once so the answers cannot drift apart between tools.
+
+    _LOTE_DE_DNS = 40
+
+    @staticmethod
+    def _nome_do_dn(dn: str) -> str:
+        """'CN=Financeiro - Leitura,OU=...' -> 'Financeiro - Leitura'."""
+        partes = dividir_dn(str(dn))
+        if not partes or "=" not in partes[0]:
+            return str(dn)
+        return partes[0].split("=", 1)[1].replace("\\,", ",").strip()
+
+    @staticmethod
+    def _pai_do_dn(dn: str) -> str:
+        return ",".join(dividir_dn(str(dn))[1:])
+
+    @staticmethod
+    def _caminho_da_ou(dn: str) -> str:
+        """Readable path of the OU that holds an object: 'Filial/Financeiro'."""
+        return caminho_legivel(dn)
+
+    def _descrever_grupos(self, dns: List[str]) -> List[Dict[str, Any]]:
+        """Name, login, type and scope of each group DN, in batched searches.
+
+        One OR search per batch instead of one BASE search per group: an
+        account in 30 groups used to cost 30 round trips. A DN the directory
+        does not return (deleted meanwhile, other domain) is still listed, by
+        the name read from the DN itself, and flagged -- dropping it would
+        understate the account's access.
+        """
+        dns = [str(d) for d in dns if d]
+        achados: Dict[str, Dict[str, Any]] = {}
+        for inicio in range(0, len(dns), self._LOTE_DE_DNS):
+            lote = dns[inicio:inicio + self._LOTE_DE_DNS]
+            filtro = "(|" + "".join(
+                f"(distinguishedName={self._escape_ldap_filter(d)})" for d in lote) + ")"
+            try:
+                resultados = self.ldap.search(
+                    search_base=self.ldap.ad_config.base_dn,
+                    search_filter=f"(&(objectClass=group){filtro})",
+                    attributes=['cn', 'sAMAccountName', 'groupType', 'description'])
+            except Exception as exc:  # noqa: BLE001 - the names still come from the DNs
+                self.logger.warning("Nao foi possivel detalhar grupos: %s", exc)
+                resultados = []
+            for entrada in resultados:
+                achados[normalizar_dn(entrada['dn'])] = entrada
+        grupos = []
+        for dn in dns:
+            entrada = achados.get(normalizar_dn(dn))
+            item: Dict[str, Any] = {"nome": self._nome_do_dn(dn)}
+            if entrada is None:
+                item["dn"] = dn
+                item["aviso"] = "detalhes nao lidos (grupo fora do dominio ou removido)"
+            else:
+                attrs = entrada['attributes']
+                login = self._get_attr(attrs, 'sAMAccountName', '')
+                if login and login != item["nome"]:
+                    item["login"] = login
+                tipo = self._get_attr(attrs, 'groupType', None)
+                if tipo is not None:
+                    tipo = int(tipo)
+                    item["tipo"] = "Security" if tipo & 0x80000000 else "Distribution"
+                    item["escopo"] = ("Global" if tipo & 0x2 else "DomainLocal" if tipo & 0x4
+                                      else "Universal" if tipo & 0x8 else "Desconhecido")
+                item["dn"] = entrada['dn']
+            grupos.append(item)
+        grupos.sort(key=lambda g: g["nome"].lower())
+        return grupos
+
+    # Built-in primary groups, used when the SID lookup is not possible.
+    _GRUPOS_PRIMARIOS = {512: "Domain Admins", 513: "Domain Users", 514: "Domain Guests",
+                         515: "Domain Computers", 516: "Domain Controllers"}
+
+    def _grupo_primario(self, attrs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """The group an account belongs to through primaryGroupID.
+
+        memberOf never lists it, so an account whose only group is Domain
+        Users showed "0 groups" -- and a model asked to copy those groups
+        went looking for them in six more tools.
+        """
+        rid = self._get_attr(attrs, 'primaryGroupID', None)
+        if rid is None:
+            return None
+        rid = int(rid)
+        nome, dn = self._GRUPOS_PRIMARIOS.get(rid, f"RID {rid}"), None
+        sid = self._get_attr(attrs, 'objectSid', None)
+        if isinstance(sid, str) and sid.startswith("S-") and "-" in sid:
+            sid_do_grupo = sid.rsplit("-", 1)[0] + f"-{rid}"
+            try:
+                achado = self.ldap.search(
+                    search_base=self.ldap.ad_config.base_dn,
+                    search_filter=f"(&(objectClass=group)(objectSid={sid_do_grupo}))",
+                    attributes=['cn'])
+                if achado:
+                    nome, dn = self._get_attr(achado[0]['attributes'], 'cn', nome), achado[0]['dn']
+            except Exception as exc:  # noqa: BLE001 - the well-known name is enough
+                self.logger.debug("Grupo primario por SID indisponivel: %s", exc)
+        resposta = {"nome": nome, "rid": rid,
+                    "nota": "grupo primario: vem de primaryGroupID, nao de memberOf; toda "
+                            "conta nova ja nasce em Domain Users, nao precisa copiar"}
+        if dn:
+            resposta["dn"] = dn
+        return resposta
+
+    def _mover_e_reler(self, dn: str, novo_pai: str) -> Dict[str, Any]:
+        """Move one object and read its new DN back from the directory.
+
+        Returns old_dn/new_dn/changed/verified. Moving into the OU the object
+        is already in is not an error: nothing is written and changed=False.
+        """
+        if normalizar_dn(self._pai_do_dn(dn)) == normalizar_dn(novo_pai):
+            return {"old_dn": dn, "new_dn": dn, "changed": False, "verified": True}
+        self.ldap.move(dn, novo_pai)
+        novo_dn = f"{dividir_dn(dn)[0]},{novo_pai}"
+        relido = self.ldap.search(search_base=novo_dn, search_filter="(objectClass=*)",
+                                  attributes=['name'], search_scope=ldap3.BASE)
+        return {"old_dn": dn, "new_dn": relido[0]['dn'] if relido else novo_dn,
+                "changed": True, "verified": bool(relido)}
+

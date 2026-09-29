@@ -13,8 +13,12 @@ import sys
 import json
 import logging
 import asyncio
+import copy
+import threading
+import unicodedata
 import uuid
 import signal
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager, contextmanager
@@ -23,6 +27,7 @@ from fastapi import FastAPI, HTTPException, Request, Header, Depends
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 import uvicorn
+from ldap3.utils.conv import escape_filter_chars
 
 from .config.loader import load_config, validate_config
 from .config.models import LoggingConfig
@@ -31,6 +36,10 @@ from .core.ad_pool import ADServerPool
 from .core.logging import setup_logging
 from .core.ldap_manager import LDAPManager
 from .core.client_security import init_security_manager
+from .core.resolver import nome_novo_de, resolver_argumentos
+from .tools.definitions import (
+    DESCRICOES_TOOLS, INSTRUCOES_DO_SERVIDOR, aplicar_descricoes,
+)
 from .tools.user import UserTools
 from .tools.group import GroupTools
 from .tools.computer import ComputerTools
@@ -113,6 +122,39 @@ async def verify_bearer_token(authorization: str = Header(None)) -> str:
 
 # ============= SERVER CLASS =============
 
+class _PorAD:
+    """A tenant attribute resolved per THREAD, not per process.
+
+    @MX:ANCHOR Every tool handler reads its directory through these
+    attributes (self.user_tools, self.ldap_manager, self.config...).
+    @MX:REASON Calls now run concurrently in worker threads. The previous design
+    swapped the attributes on the shared server object under one global lock,
+    which made the whole process serve one call at a time: a directory whose
+    VPN was down froze every other call, ad_list_ad_servers included. Bound per
+    thread, two calls to two customers cannot see each other's directory.
+    """
+
+    def __set_name__(self, owner, name):
+        self.nome = name
+        self.base = "_base_" + name
+
+    def __get__(self, obj, owner=None) -> Any:
+        if obj is None:
+            return self
+        local = obj.__dict__.get("_tenant_local")
+        bundle = getattr(local, "bundle", None) if local is not None else None
+        if bundle is not None:
+            return bundle.key if self.nome == "_bound_server" else getattr(bundle, self.nome)
+        return obj.__dict__.get(self.base)
+
+    def __set__(self, obj, valor: Any) -> None:
+        obj.__dict__[self.base] = valor
+
+
+_VERDADEIROS = {"true", "sim", "s", "yes", "y", "1", "on", "verdadeiro", "v"}
+_FALSOS = {"false", "nao", "n", "no", "0", "off", "falso", "f"}
+
+
 class ActiveDirectoryMCPFastAPI:
     """
     FastAPI-based MCP server for Active Directory.
@@ -125,20 +167,36 @@ class ActiveDirectoryMCPFastAPI:
     """
 
     # Tools that do not target one directory and therefore take no ad_server.
-    _GLOBAL_TOOLS = (
-        "ad_list_ad_servers",
-        "ad_check_ad_server_configured",
-        "ad_list_configured_clients",
-        "ad_check_client_configuration",
-        "ad_health_check_mcp_server",
-        "ad_get_mcp_schema_tools_info",
-    )
+    _GLOBAL_TOOLS = ("ad_search_directory_servers",)
 
-    # Attributes swapped per request in multi-AD mode.
+    # Attributes bound per call (per thread) in multi-AD mode.
     _TENANT_ATTRS = (
         "config", "ldap_manager", "user_tools", "group_tools",
         "computer_tools", "ou_tools", "security_tools", "security_manager",
     )
+    config = _PorAD()
+    ldap_manager = _PorAD()
+    user_tools = _PorAD()
+    group_tools = _PorAD()
+    computer_tools = _PorAD()
+    ou_tools = _PorAD()
+    security_tools = _PorAD()
+    security_manager = _PorAD()
+    _bound_server = _PorAD()
+
+    # Deadlines, all below the 30 s the Skyller client gives an MCP call: an
+    # answer that explains what is slow beats the client's empty timeout error.
+    _PRAZO_CHAMADA = float(os.getenv("AD_MCP_CALL_DEADLINE", "22"))
+    _PRAZO_TODOS = float(os.getenv("AD_MCP_FANOUT_DEADLINE", "18"))
+    # 3 s was not enough for the fuzzy path (it reads the whole index) over a
+    # slow link: measured 2026-09-21, one customer AD was cut every time while
+    # the rest answered. The fan-out ceiling is _PRAZO_TODOS, still far from
+    # the client's 30 s.
+    _GRACA_APOS_ACHADO = float(os.getenv("AD_MCP_FANOUT_GRACE", "6"))
+    # Grace given instead when a directory is still opening its connection:
+    # the connection budget plus a margin, so a cold but healthy AD answers.
+    _PRAZO_CONEXAO_FRIA = float(os.getenv("AD_MCP_FANOUT_GRACE_COLD", "12"))
+    _TRABALHADORES = int(os.getenv("AD_MCP_WORKERS", "16"))
 
     def __init__(
         self,
@@ -162,7 +220,7 @@ class ActiveDirectoryMCPFastAPI:
         self.pool = None
         self.servers_path = None
         self._bound_server = None
-        self._bind_lock = asyncio.Lock()
+        self.__dict__.setdefault("_tenant_local", threading.local())
 
         if self.multi:
             self._init_multi(servers_path)
@@ -237,20 +295,64 @@ class ActiveDirectoryMCPFastAPI:
         for key, error in invalid.items():
             self.logger.error("Servidor '%s' NAO utilizavel: %s", key, error)
 
+
+
     @contextmanager
     def _bound(self, bundle):
-        """Bind one directory's managers to self for the duration of a call."""
-        saved = {name: getattr(self, name, None) for name in self._TENANT_ATTRS}
-        previous_server = self._bound_server
-        for name in self._TENANT_ATTRS:
-            setattr(self, name, getattr(bundle, name))
-        self._bound_server = bundle.key
+        """Bind one directory to the CURRENT THREAD for the duration of a call."""
+        local = self.__dict__.setdefault("_tenant_local", threading.local())
+        anterior = getattr(local, "bundle", None)
+        local.bundle = bundle
         try:
             yield bundle
         finally:
-            for name, value in saved.items():
-                setattr(self, name, value)
-            self._bound_server = previous_server
+            local.bundle = anterior
+
+    def _trava_de_escrita(self, chave: str) -> threading.Lock:
+        """One write at a time per directory; reads are not affected."""
+        guarda = self.__dict__.setdefault("_guarda_das_travas", threading.Lock())
+        with guarda:
+            return self.__dict__.setdefault("_travas_de_escrita", {}).setdefault(
+                chave, threading.Lock())
+
+    def _executor(self) -> ThreadPoolExecutor:
+        executor = self.__dict__.get("_pool_de_threads")
+        if executor is None:
+            executor = self.__dict__.setdefault("_pool_de_threads", ThreadPoolExecutor(
+                max_workers=self._TRABALHADORES, thread_name_prefix="ad-mcp"))
+        return executor
+
+    async def _em_thread(self, funcao, prazo, tool_name, escrita=False, ad_server=None):
+        """Run blocking LDAP work off the event loop, answering within a deadline.
+
+        The work keeps running after the deadline (a thread cannot be killed);
+        the caller gets an explanation instead of the client's silent timeout.
+        """
+        loop = asyncio.get_running_loop()
+        futuro = loop.run_in_executor(self._executor(), funcao)
+        try:
+            return await asyncio.wait_for(asyncio.shield(futuro), timeout=prazo)
+        except asyncio.TimeoutError:
+            self.logger.error("tools/call %s excedeu %.0fs (ad_server=%s)", tool_name, prazo,
+                              ad_server)
+            return self._tempo_esgotado(tool_name, prazo, escrita, ad_server)
+
+    @staticmethod
+    def _tempo_esgotado(tool_name, prazo, escrita, ad_server=None) -> dict:
+        resposta = {
+            "sucesso": False,
+            "erro": "TEMPO_ESGOTADO",
+            "tool": tool_name,
+            "mensagem": (
+                f"O Active Directory nao respondeu em {prazo:.0f}s. "
+                + ("A alteracao PODE ter sido aplicada: confira o objeto com uma consulta "
+                   "antes de repetir." if escrita else
+                   "Nada foi confirmado. Use ad_test_ldap_connection_status para ver se o AD "
+                   "esta acessivel.")),
+        }
+        if ad_server:
+            resposta["ad_server"] = ad_server
+        return resposta
 
     def _init_client_security(self):
         """Initialize client security manager."""
@@ -284,600 +386,209 @@ class ActiveDirectoryMCPFastAPI:
         """Check if write operation is permitted."""
         if not self.security_manager:
             return {"permitted": True, "mode": "no_security"}
-        return self.security_manager.check_write_permission(
+        resultado = self.security_manager.check_write_permission(
             operation, target, automation_token, client_confirmation
         )
+        if not resultado.get("permitted"):
+            # A refusal that carries neither success nor erro is ambiguous to
+            # every consumer: it is what made _atualizar_e_mover treat it as a
+            # success and move the object anyway (audit 2026-09-21).
+            resultado = {"success": False, "sucesso": False,
+                         "erro": "CONFIRMACAO_NECESSARIA", **resultado}
+        return resultado
+
+    # ------------------------------------------------------------ catalogue
+    # 2026-09-19: 38 tools became 10 -- one read-only search_* and one
+    # manage_* (with an ``action``) per kind of object, the house pattern
+    # (MELHORES-PRATICAS 4.1 and 5.6). A lookup of ONE object lives in
+    # search_*, not in manage_*: the Skyller approval classifier scores a
+    # whole tool, so a get inside manage_* would put an approval card on
+    # every read.
+    ACOES = {
+        "ad_manage_directory_users": ["create", "update", "move", "enable", "disable",
+                                      "reset_password", "delete"],
+        "ad_manage_directory_groups": ["create", "update", "move", "add_members",
+                                       "remove_members", "delete"],
+        "ad_manage_directory_computers": ["create", "update", "move", "enable", "disable",
+                                          "reset_trust", "delete"],
+        "ad_manage_organizational_units": ["create", "update", "move", "delete"],
+    }
+    RELATORIOS = ["domain_policy", "privileged_groups", "admin_accounts",
+                  "password_violations", "user_permissions"]
+
+    # What each action needs and reads. A parameter that the chosen action
+    # does not read is reported back as ignored instead of vanishing.
+    REQUISITOS_POR_ACAO = {
+        ("ad_manage_directory_users", "create"): (
+            ["password", "first_name", "last_name"],
+            ["email", "ou", "copy_from_user", "must_change_password", "attributes"]),
+        ("ad_manage_directory_users", "update"): ([], ["attributes", "move_to_ou"]),
+        ("ad_manage_directory_users", "move"): (["move_to_ou"], []),
+        ("ad_manage_directory_users", "enable"): ([], ["move_to_ou"]),
+        ("ad_manage_directory_users", "disable"): ([], ["move_to_ou", "remove_from_groups"]),
+        ("ad_manage_directory_users", "reset_password"): (
+            [], ["password", "must_change_password", "password_never_expires"]),
+        ("ad_manage_directory_users", "delete"): ([], []),
+        ("ad_manage_directory_groups", "create"): (
+            [], ["display_name", "description", "ou", "group_scope", "group_type", "attributes"]),
+        ("ad_manage_directory_groups", "update"): ([], ["attributes", "description",
+                                                        "move_to_ou"]),
+        ("ad_manage_directory_groups", "move"): (["move_to_ou"], []),
+        ("ad_manage_directory_groups", "add_members"): (["members"], []),
+        ("ad_manage_directory_groups", "remove_members"): (["members"], []),
+        ("ad_manage_directory_groups", "delete"): ([], []),
+        ("ad_manage_directory_computers", "create"): (
+            [], ["description", "ou", "dns_hostname", "attributes"]),
+        ("ad_manage_directory_computers", "update"): ([], ["attributes", "description",
+                                                           "move_to_ou"]),
+        ("ad_manage_directory_computers", "move"): (["move_to_ou"], []),
+        ("ad_manage_directory_computers", "enable"): ([], []),
+        ("ad_manage_directory_computers", "disable"): ([], []),
+        ("ad_manage_directory_computers", "reset_trust"): ([], []),
+        ("ad_manage_directory_computers", "delete"): ([], []),
+        ("ad_manage_organizational_units", "create"): (
+            ["name"], ["parent_ou", "description", "managed_by", "attributes"]),
+        ("ad_manage_organizational_units", "update"): (
+            ["ou_dn"], ["attributes", "description", "managed_by", "move_to_ou"]),
+        ("ad_manage_organizational_units", "move"): (["ou_dn", "move_to_ou"], []),
+        ("ad_manage_organizational_units", "delete"): (["ou_dn"], ["force"]),
+    }
 
     def _build_tool_registry(self):
-        """Build registry of all available tools."""
+        """Build the catalogue: ten tools, the same in single and multi mode."""
+        texto = {"anyOf": [{"type": "string"}, {"type": "null"}]}
+        inteiro = {"anyOf": [{"type": "integer"}, {"type": "null"}]}
+        lista = {"anyOf": [{"type": "array", "items": {}}, {"type": "null"}]}
+        objeto = {"anyOf": [{"type": "object"}, {"type": "null"}]}
+        um_ou_varios = {"anyOf": [{"type": "string"},
+                                  {"type": "array", "items": {"type": "string"}}]}
+        confirmacao = {"automation_token": dict(texto), "client_confirmation": dict(texto)}
+        leitura = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True,
+                   "openWorldHint": True}
+        escrita = {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False,
+                   "openWorldHint": True}
+
+        def ferramenta(nome, titulo, propriedades, obrigatorios, handler, anotacoes, **extra):
+            self.tools[nome] = {
+                "description": DESCRICOES_TOOLS[nome],
+                # deepcopy: these spec dicts are shared between tools, and
+                # aplicar_descricoes mutates them -- object_types' enum leaked
+                # into every `attributes` (audit 2026-09-21).
+                # one deepcopy per property: copying the dict as a whole keeps
+                # two keys that referenced the same spec object aliased, and
+                # aplicar_descricoes then mutates both at once.
+                "inputSchema": {"type": "object",
+                                "properties": {k: copy.deepcopy(v)
+                                               for k, v in propriedades.items()},
+                                "required": list(obrigatorios)},
+                "handler": handler,
+                "annotations": {"title": titulo, **anotacoes},
+                **extra,
+            }
+
+        def acao(nome_tool):
+            return {"type": "string", "enum": list(self.ACOES[nome_tool])}
+
         self.tools = {}
 
-        # Client identification tools
-        self.tools["ad_get_client_tenant_info"] = {
-            "description": "Identificação de cliente e tenant no Active Directory — consulta informações do tenant, domínio e configuração desta instância AD. Use quando precisar confirmar qual cliente AD está conectado antes de operações destrutivas no Active Directory. Retorna nome do cliente, slug, domínio, base DN e configuração multi-tenant. Operação somente leitura.",
-            "inputSchema": {"type": "object", "properties": {}},
-            "handler": self._handle_get_client_info
-        }
+        ferramenta("ad_search_directory_servers", "Servidores de AD configurados", {
+            "server_name": texto,
+            "test_connection": {"type": "boolean", "default": False},
+        }, [], self._handle_search_servers, leitura, **{"global": True})
 
-        self.tools["ad_list_configured_clients"] = {
-            "description": "List all configured AD clients. Use this to check which clients have AD configured before trying to access an AD.",
-            "inputSchema": {"type": "object", "properties": {}},
-            "handler": self._handle_list_ad_clients
-        }
+        ferramenta("ad_search_directory_users", "Buscar usuários no AD", {
+            "username": texto, "filter_criteria": texto, "ou": texto,
+            "inactive_days": inteiro,
+            "include_disabled": {"type": "boolean", "default": False},
+            "attributes": lista,
+        }, [], self._handle_search_users, leitura)
 
-        self.tools["ad_check_client_configuration"] = {
-            "description": "Check if a specific client has AD configured. Use this before any AD operation to validate the client exists.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "client_name": {"type": "string", "description": "Client name or slug"}
-                },
-                "required": ["client_name"]
-            },
-            "handler": self._handle_check_client_exists
-        }
+        ferramenta("ad_manage_directory_users", "Gerenciar usuários do AD", {
+            "action": acao("ad_manage_directory_users"),
+            "username": {"type": "string"},
+            "password": texto, "first_name": texto, "last_name": texto, "email": texto,
+            "ou": texto, "copy_from_user": texto,
+            "must_change_password": {"type": "boolean", "default": True},
+            "password_never_expires": {"type": "boolean", "default": False},
+            "attributes": objeto, "move_to_ou": texto,
+            "remove_from_groups": {"type": "boolean", "default": False},
+            **confirmacao,
+        }, ["action", "username"], self._handle_manage_users, escrita)
 
-        # User tools
-        self.tools["ad_list_users_with_filters"] = {
-            "description": "Usuários e contas de domínio no Active Directory — lista todos os users, colaboradores, funcionários e membros do AD com filtros opcionais por OU ou atributos. Use quando precisar listar usuários por departamento, status ou atributos customizados no Active Directory. Retorna coleção de usuários com status de conta, grupos, email e atributos LDAP. Consulta somente leitura.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "ou": {"type": "string", "description": "OU DN to search in", "anyOf": [{"type": "string"}, {"type": "null"}]},
-                    "filter_criteria": {"type": "string", "description": "LDAP filter", "anyOf": [{"type": "string"}, {"type": "null"}]},
-                    "attributes": {"type": "array", "items": {}, "description": "Attributes to retrieve", "anyOf": [{"type": "array"}, {"type": "null"}]}
-                }
-            },
-            "handler": self._handle_list_users
-        }
+        ferramenta("ad_search_directory_groups", "Buscar grupos no AD", {
+            "group_name": texto,
+            "recursive": {"type": "boolean", "default": False},
+            "filter_criteria": texto, "ou": texto, "attributes": lista,
+        }, [], self._handle_search_groups, leitura)
 
-        self.tools["ad_get_user_details_by_username"] = {
-            "description": "Usuário específico, conta ou colaborador no Active Directory — busca detalhes completos de um user por username (sAMAccountName) incluindo perfil, grupos, permissões e status no AD. Use quando precisar informações detalhadas de uma conta específica no Active Directory. Retorna atributos completos: email, telefone, departamento, grupos, última autenticação e configurações de senha. Consulta somente leitura.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "username": {"type": "string", "description": "Username (sAMAccountName)"},
-                    "attributes": {"anyOf": [{"type": "array", "items": {}}, {"type": "null"}]}
-                },
-                "required": ["username"]
-            },
-            "handler": self._handle_get_user
-        }
+        ferramenta("ad_manage_directory_groups", "Gerenciar grupos do AD", {
+            "action": acao("ad_manage_directory_groups"),
+            "group_name": um_ou_varios,
+            "members": {"anyOf": [{"type": "string"},
+                                  {"type": "array", "items": {"type": "string"}},
+                                  {"type": "null"}]},
+            "display_name": texto, "description": texto, "ou": texto,
+            "group_scope": {"type": "string", "default": "Global"},
+            "group_type": {"type": "string", "default": "Security"},
+            "attributes": objeto, "move_to_ou": texto,
+            **confirmacao,
+        }, ["action", "group_name"], self._handle_manage_groups, escrita)
 
-        self.tools["ad_create_user_account"] = {
-            "description": "Criação de usuário, conta ou colaborador no Active Directory — cria novo user no AD com atributos obrigatórios e opcionais, senha inicial e OU de destino. Use quando precisar onboarding de funcionários, criação de contas de serviço ou provisionamento de novos colaboradores no Active Directory. Retorna DN do usuário criado, UPN e confirmação. Operação write - confirme cliente primeiro.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "username": {"type": "string"},
-                    "password": {"type": "string"},
-                    "first_name": {"type": "string"},
-                    "last_name": {"type": "string"},
-                    "email": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                    "ou": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                    "additional_attributes": {"anyOf": [{"type": "object"}, {"type": "null"}]},
-                    "automation_token": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                    "client_confirmation": {"anyOf": [{"type": "string"}, {"type": "null"}]}
-                },
-                "required": ["username", "password", "first_name", "last_name"]
-            },
-            "handler": self._handle_create_user
-        }
+        ferramenta("ad_search_directory_computers", "Buscar computadores no AD", {
+            "computer_name": texto, "filter_criteria": texto, "ou": texto,
+            "inactive_days": inteiro, "attributes": lista,
+        }, [], self._handle_search_computers, leitura)
 
-        self.tools["ad_modify_user_attributes"] = {
-            "description": "Atualização de atributos de usuário ou colaborador no Active Directory — modifica propriedades existentes de uma conta AD incluindo email, telefone, departamento, cargo e campos customizados. Use quando precisar alterar dados de perfil, atualizar informações organizacionais ou modificar atributos LDAP no Active Directory. Retorna confirmação e lista de atributos modificados. Operação write - confirme cliente primeiro.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "username": {"type": "string"},
-                    "attributes": {"type": "object"},
-                    "automation_token": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                    "client_confirmation": {"anyOf": [{"type": "string"}, {"type": "null"}]}
-                },
-                "required": ["username", "attributes"]
-            },
-            "handler": self._handle_modify_user
-        }
+        ferramenta("ad_manage_directory_computers", "Gerenciar computadores do AD", {
+            "action": acao("ad_manage_directory_computers"),
+            "computer_name": {"type": "string"},
+            "description": texto, "ou": texto, "dns_hostname": texto,
+            "attributes": objeto, "move_to_ou": texto,
+            **confirmacao,
+        }, ["action", "computer_name"], self._handle_manage_computers, escrita)
 
-        self.tools["ad_delete_user_account_permanently"] = {
-            "description": "Exclusão permanente de usuário ou conta no Active Directory — remove completamente um user do AD incluindo todos os atributos, grupos e referências. Use quando precisar offboarding de funcionários desligados, limpeza de contas obsoletas ou remoção definitiva no Active Directory. Retorna confirmação de exclusão. Operação write irreversível - confirme cliente primeiro antes de executar.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "username": {"type": "string"},
-                    "automation_token": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                    "client_confirmation": {"anyOf": [{"type": "string"}, {"type": "null"}]}
-                },
-                "required": ["username"]
-            },
-            "handler": self._handle_delete_user
-        }
+        ferramenta("ad_search_organizational_units", "Buscar OUs no AD", {
+            "ou_dn": texto, "object_types": lista,
+            "parent_ou": texto, "filter_criteria": texto,
+            "recursive": {"type": "boolean", "default": True},
+            "attributes": lista,
+        }, [], self._handle_search_ous, leitura)
 
-        self.tools["ad_enable_user_account_access"] = {
-            "description": "Habilitação de conta de usuário ou colaborador no Active Directory — ativa account desabilitada modificando userAccountControl para permitir autenticação e acesso aos recursos do domínio AD. Use quando precisar reativar contas suspensas, liberar acesso após licença ou habilitar usuários bloqueados no Active Directory. Retorna status de habilitação e userAccountControl atualizado. Operação write.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "username": {"type": "string"},
-                    "automation_token": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                    "client_confirmation": {"anyOf": [{"type": "string"}, {"type": "null"}]}
-                },
-                "required": ["username"]
-            },
-            "handler": self._handle_enable_user
-        }
+        ferramenta("ad_manage_organizational_units", "Gerenciar OUs do AD", {
+            "action": acao("ad_manage_organizational_units"),
+            "ou_dn": texto, "name": texto, "parent_ou": texto,
+            "description": texto, "managed_by": texto, "attributes": objeto,
+            "move_to_ou": texto,
+            "force": {"type": "boolean", "default": False},
+            **confirmacao,
+        }, ["action"], self._handle_manage_ous, escrita)
 
-        self.tools["ad_disable_user_account_access"] = {
-            "description": "Desabilitação de conta de usuário ou colaborador no Active Directory — desativa account modificando userAccountControl para bloquear autenticação preservando dados e histórico do user no AD. Use quando precisar suspender acesso temporário, bloquear contas comprometidas ou desativar usuários em licença no Active Directory. Retorna status de desabilitação e userAccountControl atualizado. Operação write.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "username": {"type": "string"},
-                    "automation_token": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                    "client_confirmation": {"anyOf": [{"type": "string"}, {"type": "null"}]}
-                },
-                "required": ["username"]
-            },
-            "handler": self._handle_disable_user
-        }
+        ferramenta("ad_search_security_reports", "Relatórios de segurança do AD", {
+            "report": {"type": "string", "enum": list(self.RELATORIOS)},
+            "username": texto,
+        }, ["report"], self._handle_security_reports, leitura)
 
-        self.tools["ad_reset_user_password_forced"] = {
-            "description": "Redefinição de senha de usuário ou colaborador no Active Directory — redefine password com geração automática ou valor customizado, força troca no próximo logon e configura políticas de expiração no AD. Use quando precisar resetar senhas esquecidas, resolver bloqueios de conta ou aplicar políticas de segurança no Active Directory. Retorna nova senha gerada e confirmação. Operação write - confirme cliente.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "username": {"type": "string"},
-                    "new_password": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                    "force_change": {"type": "boolean", "default": True},
-                    "password_never_expires": {"type": "boolean", "default": False},
-                    "automation_token": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                    "client_confirmation": {"anyOf": [{"type": "string"}, {"type": "null"}]}
-                },
-                "required": ["username"]
-            },
-            "handler": self._handle_reset_user_password
-        }
-
-        self.tools["ad_get_user_group_memberships"] = {
-            "description": "Grupos e memberships de usuário no Active Directory — lista todos os security groups, distribution groups e nested groups dos quais um user é membro direto ou indireto no AD. Use quando precisar auditar permissões, verificar acessos ou analisar memberships de colaboradores no Active Directory. Retorna lista de grupos com tipo, escopo, descrição e nível de aninhamento. Consulta somente leitura.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "username": {"type": "string"}
-                },
-                "required": ["username"]
-            },
-            "handler": self._handle_get_user_groups
-        }
-
-        # Group tools
-        self.tools["ad_list_groups_with_filters"] = {
-            "description": "Grupos de segurança e distribuição no Active Directory — lista todos os security groups, distribution groups e grupos de email do AD com filtros opcionais por OU ou tipo. Use quando precisar listar grupos por escopo, tipo ou atributos customizados no Active Directory. Retorna coleção de grupos com escopo, tipo, membros e descrição. Consulta somente leitura do AD.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "ou": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                    "filter_criteria": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                    "attributes": {"anyOf": [{"type": "array", "items": {}}, {"type": "null"}]}
-                }
-            },
-            "handler": self._handle_list_groups
-        }
-
-        self.tools["ad_get_group_details_by_name"] = {
-            "description": "Grupo específico de segurança ou distribuição no Active Directory — busca detalhes completos de um security group ou distribution group por nome (sAMAccountName) incluindo membros, escopo e tipo no AD. Use quando precisar informações detalhadas de um grupo específico no Active Directory. Retorna atributos completos: membros, parent groups, escopo, tipo e configurações. Consulta somente leitura.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "group_name": {"type": "string"},
-                    "attributes": {"anyOf": [{"type": "array", "items": {}}, {"type": "null"}]}
-                },
-                "required": ["group_name"]
-            },
-            "handler": self._handle_get_group
-        }
-
-        self.tools["ad_create_group_security_or_distribution"] = {
-            "description": "Criação de grupo de segurança ou distribuição no Active Directory — cria novo security group ou distribution group no AD com escopo Global, DomainLocal ou Universal e atributos opcionais. Use quando precisar criar grupos de permissões, grupos de email ou grupos organizacionais no Active Directory. Retorna DN do grupo criado, escopo, tipo e confirmação. Operação write - confirme cliente.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "group_name": {"type": "string"},
-                    "display_name": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                    "description": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                    "ou": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                    "group_scope": {"type": "string", "default": "Global"},
-                    "group_type": {"type": "string", "default": "Security"},
-                    "additional_attributes": {"anyOf": [{"type": "object"}, {"type": "null"}]},
-                    "automation_token": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                    "client_confirmation": {"anyOf": [{"type": "string"}, {"type": "null"}]}
-                },
-                "required": ["group_name"]
-            },
-            "handler": self._handle_create_group
-        }
-
-        self.tools["ad_modify_group_attributes"] = {
-            "description": "Atualização de atributos de grupo no Active Directory — modifica propriedades existentes de um security group ou distribution group no AD incluindo descrição, email, managed by e campos customizados. Use quando precisar alterar configurações de grupos, atualizar responsáveis ou modificar atributos LDAP no Active Directory. Retorna confirmação e lista de atributos modificados. Operação write - confirme cliente.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "group_name": {"type": "string"},
-                    "attributes": {"type": "object"},
-                    "automation_token": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                    "client_confirmation": {"anyOf": [{"type": "string"}, {"type": "null"}]}
-                },
-                "required": ["group_name", "attributes"]
-            },
-            "handler": self._handle_modify_group
-        }
-
-        self.tools["ad_delete_group_permanently"] = {
-            "description": "Exclusão permanente de grupo no Active Directory — remove completamente um security group ou distribution group do AD incluindo todas as associações e referências de membros. Use quando precisar limpeza de grupos obsoletos, remoção de grupos temporários ou exclusão definitiva no Active Directory. Retorna confirmação de exclusão. Operação write irreversível - confirme cliente primeiro antes de executar.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "group_name": {"type": "string"},
-                    "automation_token": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                    "client_confirmation": {"anyOf": [{"type": "string"}, {"type": "null"}]}
-                },
-                "required": ["group_name"]
-            },
-            "handler": self._handle_delete_group
-        }
-
-        self.tools["ad_add_member_to_group"] = {
-            "description": "Adição de membro a grupo no Active Directory — adiciona user, computer ou nested group como membro de um security group ou distribution group no AD. Use quando precisar conceder permissões, adicionar usuários a grupos de email ou criar nested groups no Active Directory. Retorna confirmação de adição e DN do membro. Operação write - confirme cliente primeiro.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "group_name": {"type": "string"},
-                    "member_dn": {"type": "string"},
-                    "automation_token": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                    "client_confirmation": {"anyOf": [{"type": "string"}, {"type": "null"}]}
-                },
-                "required": ["group_name", "member_dn"]
-            },
-            "handler": self._handle_add_group_member
-        }
-
-        self.tools["ad_remove_member_from_group"] = {
-            "description": "Remoção de membro de grupo no Active Directory — remove user, computer ou nested group de um security group ou distribution group no AD. Use quando precisar revogar permissões, remover usuários de grupos de email ou desfazer nested groups no Active Directory. Retorna confirmação de remoção e DN do membro. Operação write - confirme cliente primeiro.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "group_name": {"type": "string"},
-                    "member_dn": {"type": "string"},
-                    "automation_token": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                    "client_confirmation": {"anyOf": [{"type": "string"}, {"type": "null"}]}
-                },
-                "required": ["group_name", "member_dn"]
-            },
-            "handler": self._handle_remove_group_member
-        }
-
-        self.tools["ad_get_group_members_recursive"] = {
-            "description": "Membros de grupo com recursão no Active Directory — lista todos os members de um security group ou distribution group incluindo nested groups expandidos recursivamente no AD. Use quando precisar auditar memberships completos, verificar permissões indiretas ou analisar hierarquia de grupos no Active Directory. Retorna lista de membros com tipo, nível de aninhamento e DN. Consulta somente leitura.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "group_name": {"type": "string"},
-                    "recursive": {"type": "boolean", "default": False}
-                },
-                "required": ["group_name"]
-            },
-            "handler": self._handle_get_group_members
-        }
-
-        # Computer tools
-        self.tools["ad_list_computers_with_filters"] = {
-            "description": "Computadores e workstations no Active Directory — lista todos os computer accounts, estações de trabalho e servidores do AD com filtros opcionais por OU ou sistema operacional. Use quando precisar inventariar máquinas, auditar computer accounts ou buscar por tipo de OS no Active Directory. Retorna coleção de computers com OS, último logon, status e atributos. Consulta somente leitura do AD.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "ou": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                    "filter_criteria": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                    "attributes": {"anyOf": [{"type": "array", "items": {}}, {"type": "null"}]}
-                }
-            },
-            "handler": self._handle_list_computers
-        }
-
-        self.tools["ad_get_computer_details_by_name"] = {
-            "description": "Computador específico ou workstation no Active Directory — busca detalhes completos de um computer account por nome (sAMAccountName) incluindo OS, último logon, grupos e status no AD. Use quando precisar informações detalhadas de uma máquina específica no Active Directory. Retorna atributos completos: sistema operacional, DNS, service principal names, grupos e configurações. Consulta somente leitura.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "computer_name": {"type": "string"},
-                    "attributes": {"anyOf": [{"type": "array", "items": {}}, {"type": "null"}]}
-                },
-                "required": ["computer_name"]
-            },
-            "handler": self._handle_get_computer
-        }
-
-        self.tools["ad_create_computer_account"] = {
-            "description": "Criação de conta de computador ou workstation no Active Directory — cria novo computer account no AD com DNS hostname, service principal names e OU de destino. Use quando precisar pré-criar contas de máquinas, provisionamento de workstations ou criação de computer objects no Active Directory. Retorna DN do computer criado, DNS hostname e SPNs. Operação write - confirme cliente.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "computer_name": {"type": "string"},
-                    "description": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                    "ou": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                    "dns_hostname": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                    "additional_attributes": {"anyOf": [{"type": "object"}, {"type": "null"}]},
-                    "automation_token": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                    "client_confirmation": {"anyOf": [{"type": "string"}, {"type": "null"}]}
-                },
-                "required": ["computer_name"]
-            },
-            "handler": self._handle_create_computer
-        }
-
-        self.tools["ad_modify_computer_attributes"] = {
-            "description": "Atualização de atributos de computador no Active Directory — modifica propriedades existentes de um computer account no AD incluindo descrição, localização, managed by e campos customizados. Use quando precisar alterar configurações de máquinas, atualizar informações de inventário ou modificar atributos LDAP no Active Directory. Retorna confirmação e lista de atributos modificados. Operação write - confirme cliente.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "computer_name": {"type": "string"},
-                    "attributes": {"type": "object"},
-                    "automation_token": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                    "client_confirmation": {"anyOf": [{"type": "string"}, {"type": "null"}]}
-                },
-                "required": ["computer_name", "attributes"]
-            },
-            "handler": self._handle_modify_computer
-        }
-
-        self.tools["ad_delete_computer_account_permanently"] = {
-            "description": "Exclusão permanente de conta de computador no Active Directory — remove completamente um computer account do AD incluindo todas as associações, SPNs e referências. Use quando precisar descomissionamento de máquinas, limpeza de computer accounts obsoletos ou remoção definitiva no Active Directory. Retorna confirmação de exclusão. Operação write irreversível - confirme cliente primeiro antes de executar.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "computer_name": {"type": "string"},
-                    "automation_token": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                    "client_confirmation": {"anyOf": [{"type": "string"}, {"type": "null"}]}
-                },
-                "required": ["computer_name"]
-            },
-            "handler": self._handle_delete_computer
-        }
-
-        self.tools["ad_enable_computer_account_trust"] = {
-            "description": "Habilitação de conta de computador no Active Directory — ativa computer account desabilitado modificando userAccountControl para restabelecer trust relationship e permitir autenticação de máquina no AD. Use quando precisar reativar contas de computadores, restabelecer trust de workstations ou habilitar computer accounts no Active Directory. Retorna status de habilitação e userAccountControl atualizado. Operação write.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "computer_name": {"type": "string"},
-                    "automation_token": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                    "client_confirmation": {"anyOf": [{"type": "string"}, {"type": "null"}]}
-                },
-                "required": ["computer_name"]
-            },
-            "handler": self._handle_enable_computer
-        }
-
-        self.tools["ad_disable_computer_account_trust"] = {
-            "description": "Desabilitação de conta de computador no Active Directory — desativa computer account modificando userAccountControl para quebrar trust relationship e bloquear autenticação de máquina preservando histórico no AD. Use quando precisar isolar máquinas comprometidas, desativar workstations antigas ou bloquear computer accounts no Active Directory. Retorna status de desabilitação e userAccountControl atualizado. Operação write.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "computer_name": {"type": "string"},
-                    "automation_token": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                    "client_confirmation": {"anyOf": [{"type": "string"}, {"type": "null"}]}
-                },
-                "required": ["computer_name"]
-            },
-            "handler": self._handle_disable_computer
-        }
-
-        self.tools["ad_reset_computer_password_trust"] = {
-            "description": "Redefinição de senha de conta de computador no Active Directory — redefine password do computer account para reestabelecer trust relationship e resolver erros de autenticação de máquina no AD. Use quando precisar corrigir trust relationship quebrado, resolver erros de logon de workstation ou resetar senhas de computer accounts no Active Directory. Retorna confirmação de reset. Operação write - confirme cliente.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "computer_name": {"type": "string"},
-                    "automation_token": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                    "client_confirmation": {"anyOf": [{"type": "string"}, {"type": "null"}]}
-                },
-                "required": ["computer_name"]
-            },
-            "handler": self._handle_reset_computer_password
-        }
-
-        self.tools["ad_get_inactive_computers_by_days"] = {
-            "description": "Computadores inativos ou obsoletos no Active Directory — identifica computer accounts que não autenticaram no AD por número de dias especificado, indicando máquinas desconectadas ou obsoletas. Use quando precisar auditar inventário, identificar workstations abandonadas ou realizar limpeza de computer accounts no Active Directory. Retorna lista de computers com dias de inatividade, último logon e status. Consulta somente leitura.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "days": {"type": "integer", "default": 90}
-                }
-            },
-            "handler": self._handle_get_stale_computers
-        }
-
-        # OU tools
-        self.tools["ad_list_organizational_units_hierarchy"] = {
-            "description": "Unidades organizacionais e estrutura hierárquica no Active Directory — lista todas as OUs (organizational units), containers e estrutura de organização do AD com opção de busca recursiva. Use quando precisar mapear hierarquia organizacional, listar OUs por nível ou auditar estrutura de containers no Active Directory. Retorna coleção de OUs com nível hierárquico, parent OU e GPOs vinculados. Consulta somente leitura.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "parent_ou": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                    "filter_criteria": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                    "attributes": {"anyOf": [{"type": "array", "items": {}}, {"type": "null"}]},
-                    "recursive": {"type": "boolean", "default": True}
-                }
-            },
-            "handler": self._handle_list_organizational_units
-        }
-
-        self.tools["ad_get_organizational_unit_details"] = {
-            "description": "Unidade organizacional específica no Active Directory — busca detalhes completos de uma OU (organizational unit) por DN incluindo objetos contidos, GPOs vinculados e managed by no AD. Use quando precisar informações detalhadas de uma OU específica, auditar GPO links ou verificar conteúdo de containers no Active Directory. Retorna atributos completos: objetos, sub-OUs, GPOs e configurações. Consulta somente leitura.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "ou_dn": {"type": "string"},
-                    "attributes": {"anyOf": [{"type": "array", "items": {}}, {"type": "null"}]}
-                },
-                "required": ["ou_dn"]
-            },
-            "handler": self._handle_get_organizational_unit
-        }
-
-        self.tools["ad_create_organizational_unit"] = {
-            "description": "Criação de unidade organizacional no Active Directory — cria nova OU (organizational unit) no AD com parent OU, descrição, managed by e atributos opcionais. Use quando precisar estruturar hierarquia organizacional, criar containers para segregação ou organizar objetos por departamento no Active Directory. Retorna DN da OU criada, parent OU e confirmação. Operação write - confirme cliente primeiro.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string"},
-                    "parent_ou": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                    "description": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                    "managed_by": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                    "additional_attributes": {"anyOf": [{"type": "object"}, {"type": "null"}]},
-                    "automation_token": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                    "client_confirmation": {"anyOf": [{"type": "string"}, {"type": "null"}]}
-                },
-                "required": ["name"]
-            },
-            "handler": self._handle_create_organizational_unit
-        }
-
-        self.tools["ad_modify_organizational_unit_attributes"] = {
-            "description": "Atualização de atributos de unidade organizacional no Active Directory — modifica propriedades existentes de uma OU (organizational unit) no AD incluindo descrição, managed by, location e campos customizados. Use quando precisar alterar configurações de OUs, atualizar responsáveis ou modificar atributos LDAP no Active Directory. Retorna confirmação e lista de atributos modificados. Operação write - confirme cliente.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "ou_dn": {"type": "string"},
-                    "attributes": {"type": "object"},
-                    "automation_token": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                    "client_confirmation": {"anyOf": [{"type": "string"}, {"type": "null"}]}
-                },
-                "required": ["ou_dn", "attributes"]
-            },
-            "handler": self._handle_modify_organizational_unit
-        }
-
-        self.tools["ad_delete_organizational_unit_forced"] = {
-            "description": "Exclusão de unidade organizacional no Active Directory — remove OU (organizational unit) do AD com opção de exclusão forçada incluindo todos os objetos contidos. Use quando precisar reestruturar hierarquia, remover OUs obsoletas ou executar limpeza de containers no Active Directory. Retorna confirmação de exclusão e contagem de objetos removidos. Operação write irreversível - confirme cliente primeiro.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "ou_dn": {"type": "string"},
-                    "force": {"type": "boolean", "default": False},
-                    "automation_token": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                    "client_confirmation": {"anyOf": [{"type": "string"}, {"type": "null"}]}
-                },
-                "required": ["ou_dn"]
-            },
-            "handler": self._handle_delete_organizational_unit
-        }
-
-        self.tools["ad_move_organizational_unit_parent"] = {
-            "description": "Movimentação de unidade organizacional no Active Directory — move OU (organizational unit) para novo parent container no AD preservando todos os objetos contidos e GPO links. Use quando precisar reestruturar hierarquia organizacional, reorganizar containers ou mover OUs entre níveis no Active Directory. Retorna novo DN, novo parent OU e confirmação. Operação write - confirme cliente primeiro antes de executar.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "ou_dn": {"type": "string"},
-                    "new_parent_dn": {"type": "string"},
-                    "automation_token": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                    "client_confirmation": {"anyOf": [{"type": "string"}, {"type": "null"}]}
-                },
-                "required": ["ou_dn", "new_parent_dn"]
-            },
-            "handler": self._handle_move_organizational_unit
-        }
-
-        self.tools["ad_get_organizational_unit_objects"] = {
-            "description": "Conteúdo de unidade organizacional no Active Directory — lista todos os objetos contidos em uma OU (organizational unit) incluindo users, groups, computers e sub-OUs com filtros opcionais por tipo no AD. Use quando precisar auditar conteúdo de OUs, inventariar objetos por container ou verificar estrutura organizacional no Active Directory. Retorna lista de objetos com tipo, DN e atributos básicos. Consulta somente leitura.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "ou_dn": {"type": "string"},
-                    "object_types": {"anyOf": [{"type": "array", "items": {}}, {"type": "null"}]}
-                },
-                "required": ["ou_dn"]
-            },
-            "handler": self._handle_get_organizational_unit_contents
-        }
-
-        # Security tools
-        self.tools["ad_get_domain_security_policy_info"] = {
-            "description": "Informações de domínio e políticas de segurança no Active Directory — consulta configurações do domínio AD incluindo password policy, lockout policy, SID do domínio e políticas de segurança. Use quando precisar auditar políticas de senha, verificar configurações de lockout ou obter informações gerais do domínio no Active Directory. Retorna políticas de senha, lockout threshold, max password age e configurações. Consulta somente leitura.",
-            "inputSchema": {"type": "object", "properties": {}},
-            "handler": self._handle_get_domain_info
-        }
-
-        self.tools["ad_get_privileged_security_groups"] = {
-            "description": "Grupos privilegiados e administrativos no Active Directory — lista todos os security groups com privilégios elevados no AD incluindo Domain Admins, Enterprise Admins, Schema Admins e grupos de operadores. Use quando precisar auditar permissões administrativas, verificar memberships privilegiados ou realizar análise de segurança no Active Directory. Retorna lista de grupos privilegiados com membros, SID e descrição. Consulta somente leitura.",
-            "inputSchema": {"type": "object", "properties": {}},
-            "handler": self._handle_get_privileged_groups
-        }
-
-        self.tools["ad_get_user_effective_permissions"] = {
-            "description": "Permissões efetivas de usuário no Active Directory — analisa memberships de grupos de um user no AD para determinar permissões efetivas, grupos privilegiados e riscos de segurança. Use quando precisar auditar permissões de contas, verificar acessos elevados ou analisar riscos de segurança de usuários no Active Directory. Retorna permissões efetivas, grupos privilegiados e assessment de segurança. Consulta somente leitura.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "username": {"type": "string"}
-                },
-                "required": ["username"]
-            },
-            "handler": self._handle_get_user_permissions
-        }
-
-        self.tools["ad_get_inactive_users_by_days"] = {
-            "description": "Usuários inativos ou sem autenticação no Active Directory — identifica user accounts que não autenticaram no AD por número de dias especificado, indicando contas obsoletas ou não utilizadas. Use quando precisar auditar contas inativas, identificar usuários para desativação ou realizar análise de segurança no Active Directory. Retorna lista de usuários com dias de inatividade, último logon, grupos e status. Consulta somente leitura.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "days": {"type": "integer", "default": 90},
-                    "include_disabled": {"type": "boolean", "default": False}
-                }
-            },
-            "handler": self._handle_get_inactive_users
-        }
-
-        self.tools["ad_get_password_policy_violations"] = {
-            "description": "Violações de política de senha no Active Directory — identifica user accounts com passwords que violam políticas de segurança no AD incluindo senhas expiradas, senhas que nunca expiram e non-compliance com políticas. Use quando precisar auditar conformidade de senhas, identificar contas com riscos de segurança ou validar políticas de password no Active Directory. Retorna lista de violações com tipo, usuário e detalhes. Consulta somente leitura.",
-            "inputSchema": {"type": "object", "properties": {}},
-            "handler": self._handle_get_password_policy_violations
-        }
-
-        self.tools["ad_audit_administrative_accounts"] = {
-            "description": "Auditoria de contas administrativas no Active Directory — realiza audit abrangente de administrative accounts no AD incluindo memberships privilegiados, compliance de políticas e assessment de riscos de segurança. Use quando precisar auditar segurança de contas admin, verificar conformidade de políticas ou realizar análise de riscos no Active Directory. Retorna relatório completo com violações, riscos e recomendações. Consulta somente leitura.",
-            "inputSchema": {"type": "object", "properties": {}},
-            "handler": self._handle_audit_admin_accounts
-        }
-
-        # System tools
-        self.tools["ad_test_ldap_connection_status"] = {
-            "description": "Teste de conexão LDAP com Active Directory — verifica conectividade LDAP, bind authentication e capacidade de search no servidor AD para diagnosticar problemas de conexão. Use quando precisar troubleshooting de conectividade, verificar credenciais LDAP ou validar acesso ao servidor no Active Directory. Retorna status de conexão, bind result, server info e resultados de test search. Operação diagnóstica somente leitura.",
-            "inputSchema": {"type": "object", "properties": {}},
-            "handler": self._handle_test_connection
-        }
-
-        self.tools["ad_health_check_mcp_server"] = {
-            "description": "Health check do servidor MCP Active Directory — verifica status geral do MCP server AD incluindo conexão LDAP, client info, testes de inicialização e disponibilidade de serviços. Use quando precisar monitoramento de saúde, alertas de disponibilidade ou diagnóstico de problemas no servidor MCP do Active Directory. Retorna status do servidor, conexão LDAP, client info e resultados de health checks. Operação diagnóstica somente leitura.",
-            "inputSchema": {"type": "object", "properties": {}},
-            "handler": self._handle_health
-        }
-
-        self.tools["ad_get_mcp_schema_tools_info"] = {
-            "description": "Informações de schema e tools disponíveis no Active Directory MCP — retorna metadados completos de todas as tools disponíveis no servidor MCP AD incluindo parâmetros, permissões e documentação. Use quando precisar documentação de API, descoberta de tools disponíveis ou informações de schema no servidor MCP do Active Directory. Retorna lista completa de tools, parâmetros, operations e client info. Operação diagnóstica somente leitura.",
-            "inputSchema": {"type": "object", "properties": {}},
-            "handler": self._handle_get_schema_info
-        }
+        # Not listed: reached only through ALIASES_DE_TOOLS (old names) and
+        # internally (test_connection). They keep their own code paths.
+        ferramenta("ad_test_ldap_connection_status", "Teste de conexão LDAP", {},
+                   [], self._handle_test_connection, leitura, oculta=True)
+        ferramenta("ad_move_organizational_unit_parent", "Mover objeto de OU", {
+            "object_name": {"type": "string"},
+            "object_type": {"type": "string",
+                            "enum": ["user", "computer", "group", "organizational_unit"]},
+            "ou_dn": {"type": "string"}, "new_parent_dn": {"type": "string"},
+            **confirmacao,
+        }, ["new_parent_dn"], self._handle_move_organizational_unit, escrita, oculta=True)
 
         # ---------------------------------------------------------------
         # Multi-AD layer (no-op in single mode)
         # ---------------------------------------------------------------
-        for name in self._GLOBAL_TOOLS:
-            if name in self.tools:
-                self.tools[name]["global"] = True
-
         if self.multi:
-            self._register_multi_ad_tools()
             self._inject_ad_server_parameter()
+
+        # Parameter texts and enums come from tools/definitions.py.
+        for name, tool in self.tools.items():
+            aplicar_descricoes(name, tool["inputSchema"])
 
     # ============= MULTI-AD LAYER =============
 
@@ -886,7 +597,8 @@ class ActiveDirectoryMCPFastAPI:
         "description": (
             "Servidor de Active Directory alvo. OBRIGATORIO nesta tool de escrita: "
             "uma alteracao precisa nomear um unico diretorio, e 'todos' nao e aceito. "
-            "Use ad_list_ad_servers para os nomes."
+            "Aceita o nome do cliente como o usuario falou (ex.: Empresa Alfa), apelido, "
+            "dominio ou slug; nao precisa consultar ad_list_ad_servers antes."
         ),
     }
 
@@ -896,60 +608,10 @@ class ActiveDirectoryMCPFastAPI:
             "Servidor de Active Directory a consultar. Opcional: se omitido, ou com "
             "'todos'/'all', a busca roda em TODOS os ADs configurados e a resposta diz "
             "em qual cada resultado foi encontrado. Use isso quando nao souber onde a "
-            "pessoa ou o objeto esta. Use ad_list_ad_servers para os nomes."
+            "pessoa ou o objeto esta. Aceita o nome do cliente (ex.: Empresa Alfa), "
+            "apelido, dominio ou slug."
         ),
     }
-
-    def _register_multi_ad_tools(self) -> None:
-        """Swap the client-shaped catalogue tools for server-shaped ones.
-
-        In multi-AD mode the axis is the SERVER, not "the client": a name with
-        "client" in it invites the model to pass a customer name where a routing
-        key is expected. The two legacy tools are also redundant here -- three
-        tools answering "which directories exist?" is three chances to pick the
-        wrong one -- so multi mode registers exactly two.
-        """
-        self.tools.pop("ad_list_configured_clients", None)
-        self.tools.pop("ad_check_client_configuration", None)
-
-        self.tools["ad_check_ad_server_configured"] = {
-            "description": (
-                "Verificacao de servidor de Active Directory nesta instancia \u2014 confirma se "
-                "um nome, apelido, dominio ou nome de cliente corresponde a um AD configurado "
-                "aqui e devolve o valor exato para o parametro ad_server. Use quando o usuario "
-                "citar o cliente pelo nome e voce precisar do ad_server correspondente, ou para "
-                "responder se determinado cliente tem AD nesta instancia. Retorna se existe, o "
-                "ad_server a usar, nome e dominio; quando nao existe, retorna a lista dos que "
-                "existem. Consulta somente leitura."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "server_name": {
-                        "type": "string",
-                        "description": "Nome, apelido, dominio ou nome do cliente a verificar",
-                    }
-                },
-                "required": ["server_name"],
-            },
-            "handler": self._handle_check_client_exists,
-            "global": True,
-        }
-
-        self.tools["ad_list_ad_servers"] = {
-            "description": (
-                "Servidores de Active Directory disponiveis nesta instancia \u2014 lista os ADs "
-                "configurados com o nome exato a usar no parametro ad_server, dominio, host "
-                "LDAP, base DN, unidades organizacionais e estado da conexao. Use quando nao "
-                "souber qual valor passar em ad_server, quando o usuario citar um cliente sem "
-                "dizer o servidor, ou para confirmar se um cliente tem AD configurado aqui. "
-                "Retorna nome, apelidos, dominio, servidor LDAP, base DN, OUs e status por "
-                "servidor. Credenciais de bind nao sao expostas. Consulta somente leitura."
-            ),
-            "inputSchema": {"type": "object", "properties": {}},
-            "handler": self._handle_list_ad_servers,
-            "global": True,
-        }
 
     # Values that mean "every configured directory".
     _TODOS = {"all", "todos", "todas", "*", "any", "qualquer", "geral", "tudo"}
@@ -996,6 +658,9 @@ class ActiveDirectoryMCPFastAPI:
             tool["inputSchema"] = schema
 
     def _handle_list_ad_servers(self, params: dict) -> dict:
+        procurado = str(params.get("server_name") or "").strip()
+        if procurado:
+            return self._handle_check_client_exists({"server_name": procurado})
         if not self.multi or self.pool is None:
             return {
                 "modo": "single",
@@ -1026,6 +691,287 @@ class ActiveDirectoryMCPFastAPI:
         if isinstance(result, dict):
             return result
         return {"result": str(result)}
+
+    # ============= search_* / manage_* DISPATCH =============
+    # Each action reuses the per-operation handler below it, which already
+    # checks write permission and was covered by the write audit. The
+    # dispatcher only validates what the action needs and says what it ignored.
+
+    _PARAMETROS_DE_BASE = {"action", "ad_server", "automation_token", "client_confirmation",
+                           "username", "group_name", "computer_name"}
+
+    # Where each manage_* tool carries the name of the object it acts on, for
+    # the audit log and the confirmation gate.
+    _ALVO_DA_TOOL = {
+        "ad_manage_directory_users": "username",
+        "ad_manage_directory_groups": "group_name",
+        "ad_manage_directory_computers": "computer_name",
+        "ad_manage_organizational_units": "ou_dn",
+    }
+
+    @staticmethod
+    def _recusado(payload) -> bool:
+        """Whether a step refused. A permission refusal carries 'permitted',
+        not 'success': looking only at 'success' counted it as a success and
+        let the next step run (audit 2026-09-21)."""
+        if not isinstance(payload, dict):
+            return False
+        return (payload.get("success") is False or payload.get("sucesso") is False
+                or payload.get("permitted") is False)
+
+    def _checar_acao(self, tool_name: str, params: dict):
+        """Return (action, refusal, ignored) for a manage_* call.
+
+        @MX:ANCHOR Every action of every manage_* tool passes here, so this is
+        where the write gate is applied -- once.
+        @MX:REASON The dispatch introduced a second way in: action="move" went
+        straight to the move helper and skipped the confirmation that every
+        other write asks for (audit 2026-09-21).
+        """
+        acao = params.get("action")
+        obrigatorios, opcionais = self.REQUISITOS_POR_ACAO[(tool_name, acao)]
+        faltando = [c for c in obrigatorios if params.get(c) in (None, "", [], {})]
+        if not faltando:
+            alvo = params.get(self._ALVO_DA_TOOL.get(tool_name, "")) or params.get("name") or ""
+            permissao = self._check_write_permission(
+                f"{tool_name}:{acao}", str(alvo),
+                params.get("automation_token"), params.get("client_confirmation"))
+            if not permissao.get("permitted"):
+                return acao, permissao, []
+        if faltando:
+            return acao, {
+                "sucesso": False, "erro": "PARAMETRO_OBRIGATORIO_AUSENTE", "tool": tool_name,
+                "mensagem": (f"action='{acao}' exige {', '.join(faltando)}. Nada foi executado."),
+                "parametros_faltando": faltando,
+            }, []
+        props = self.tools[tool_name]["inputSchema"].get("properties") or {}
+        usados = set(obrigatorios) | set(opcionais) | self._PARAMETROS_DE_BASE
+        if tool_name == "ad_manage_organizational_units":
+            usados |= {"ou_dn"}
+        ignorados = []
+        for chave, valor in params.items():
+            if chave.startswith("_") or chave in usados or chave not in props:
+                continue
+            padrao = (props.get(chave) or {}).get("default")
+            if valor not in (None, "", [], {}) and valor != padrao:
+                ignorados.append(chave)
+        return acao, None, ignorados
+
+    @staticmethod
+    def _com_ignorados(resultado, ignorados):
+        if ignorados and isinstance(resultado, dict):
+            resultado = dict(resultado)
+            resultado["parametros_ignorados"] = {
+                "nomes": ignorados,
+                "motivo": "a action escolhida nao usa estes parametros; nada foi feito com eles",
+            }
+        return resultado
+
+    def _dn_por_login(self, filtro_classe: str, login: str) -> Optional[str]:
+        achado = self.ldap_manager.search(
+            search_base=self.config.active_directory.base_dn,
+            search_filter=f"(&{filtro_classe}(sAMAccountName={escape_filter_chars(login)}))",
+            attributes=["sAMAccountName"])
+        return achado[0]["dn"] if achado else None
+
+    def _mover(self, filtro_classe: str, login: str, destino: str, rotulo: str) -> dict:
+        dn = self._dn_por_login(filtro_classe, login)
+        if dn is None:
+            return {"success": False, "error": f"{rotulo} '{login}' not found"}
+        return self._format_result(self.ou_tools.move_object(dn, destino))
+
+    def _atualizar_e_mover(self, atualizar, mover, params: dict, tool_name: str) -> dict:
+        """update = change attributes and/or move, in that order, both reported."""
+        if not params.get("attributes") and not params.get("description") \
+                and not params.get("managed_by") and not params.get("move_to_ou"):
+            return {
+                "sucesso": False, "erro": "PARAMETRO_OBRIGATORIO_AUSENTE", "tool": tool_name,
+                "mensagem": ("action='update' precisa de algo a alterar: attributes (campos) "
+                             "e/ou move_to_ou (nova OU). Nada foi executado."),
+            }
+        partes = {}
+        if params.get("attributes") or params.get("description") or params.get("managed_by"):
+            partes["atualizacao"] = atualizar()
+            if self._recusado(partes["atualizacao"]):
+                # Do not move an object whose update was refused: the call
+                # would end up half applied and reported as a success.
+                return partes["atualizacao"]
+        if params.get("move_to_ou"):
+            partes["movimento"] = mover()
+        if len(partes) == 1:
+            return next(iter(partes.values()))
+        ok = not any(self._recusado(v) for v in partes.values())
+        return {"success": ok, **partes}
+
+    # -------------------------------------------------------------- servers
+    def _handle_search_servers(self, params: dict) -> dict:
+        return self._handle_list_ad_servers(params)
+
+    # ---------------------------------------------------------------- users
+    _FILTRO_PESSOA = "(objectCategory=person)(objectClass=user)"
+
+    def _handle_search_users(self, params: dict) -> dict:
+        if params.get("username"):
+            return self._handle_get_user(params)
+        if params.get("inactive_days") is not None:
+            return self._handle_get_inactive_users({
+                "days": params["inactive_days"],
+                "include_disabled": params.get("include_disabled", False) is True})
+        return self._handle_list_users(params)
+
+    def _handle_manage_users(self, params: dict) -> dict:
+        tool = "ad_manage_directory_users"
+        acao, recusa, ignorados = self._checar_acao(tool, params)
+        if recusa:
+            return recusa
+        p = dict(params)
+        if acao == "create":
+            p["additional_attributes"] = p.pop("attributes", None)
+            r = self._handle_create_user(p)
+        elif acao == "update":
+            r = self._atualizar_e_mover(
+                lambda: self._handle_modify_user(p),
+                lambda: self._mover(self._FILTRO_PESSOA, p["username"], p["move_to_ou"],
+                                    "User"), p, tool)
+        elif acao == "move":
+            r = self._mover(self._FILTRO_PESSOA, p["username"], p["move_to_ou"], "User")
+        elif acao == "enable":
+            r = self._handle_enable_user(p)
+        elif acao == "disable":
+            r = self._handle_disable_user(p)
+        elif acao == "reset_password":
+            r = self._handle_reset_user_password({
+                **p, "new_password": p.get("password"),
+                "force_change": p.get("must_change_password", True) is not False})
+        else:
+            r = self._handle_delete_user(p)
+        return self._com_ignorados(r, ignorados)
+
+    # --------------------------------------------------------------- groups
+    def _handle_search_groups(self, params: dict) -> dict:
+        if params.get("group_name"):
+            return self._handle_get_group(params)
+        return self._handle_list_groups(params)
+
+    def _handle_manage_groups(self, params: dict) -> dict:
+        tool = "ad_manage_directory_groups"
+        acao, recusa, ignorados = self._checar_acao(tool, params)
+        if recusa:
+            return recusa
+        p = dict(params)
+        grupos = p.get("group_name")
+        if acao not in ("add_members", "remove_members") and isinstance(grupos, list):
+            if len(grupos) != 1:
+                return {"sucesso": False, "erro": "PARAMETRO_INVALIDO", "tool": tool,
+                        "mensagem": (f"action='{acao}' age sobre UM grupo; lista de grupos so "
+                                     "vale para add_members/remove_members. Nada foi executado.")}
+            p["group_name"] = grupos[0]
+        if acao == "create":
+            p["additional_attributes"] = p.pop("attributes", None)
+            r = self._handle_create_group(p)
+        elif acao == "update":
+            atributos = dict(p.get("attributes") or {})
+            if p.get("description"):
+                atributos.setdefault("description", p["description"])
+            r = self._atualizar_e_mover(
+                lambda: self._handle_modify_group({**p, "attributes": atributos}),
+                lambda: self._mover("(objectClass=group)", p["group_name"], p["move_to_ou"],
+                                    "Group"), p, tool)
+        elif acao == "move":
+            r = self._mover("(objectClass=group)", p["group_name"], p["move_to_ou"], "Group")
+        elif acao in ("add_members", "remove_members"):
+            p["member_dn"] = p.get("members")
+            r = self._handle_add_group_member(p) if acao == "add_members" \
+                else self._handle_remove_group_member(p)
+        else:
+            r = self._handle_delete_group(p)
+        return self._com_ignorados(r, ignorados)
+
+    # ------------------------------------------------------------ computers
+    def _handle_search_computers(self, params: dict) -> dict:
+        if params.get("computer_name"):
+            return self._handle_get_computer(params)
+        if params.get("inactive_days") is not None:
+            return self._handle_get_stale_computers({"days": params["inactive_days"]})
+        return self._handle_list_computers(params)
+
+    def _handle_manage_computers(self, params: dict) -> dict:
+        tool = "ad_manage_directory_computers"
+        acao, recusa, ignorados = self._checar_acao(tool, params)
+        if recusa:
+            return recusa
+        p = dict(params)
+        login = str(p["computer_name"])
+        login = login if login.endswith("$") else login + "$"
+        if acao == "create":
+            p["additional_attributes"] = p.pop("attributes", None)
+            r = self._handle_create_computer(p)
+        elif acao == "update":
+            atributos = dict(p.get("attributes") or {})
+            if p.get("description"):
+                atributos.setdefault("description", p["description"])
+            r = self._atualizar_e_mover(
+                lambda: self._handle_modify_computer({**p, "attributes": atributos}),
+                lambda: self._mover("(objectClass=computer)", login, p["move_to_ou"],
+                                    "Computer"), p, tool)
+        elif acao == "move":
+            r = self._mover("(objectClass=computer)", login, p["move_to_ou"], "Computer")
+        elif acao == "enable":
+            r = self._handle_enable_computer(p)
+        elif acao == "disable":
+            r = self._handle_disable_computer(p)
+        elif acao == "reset_trust":
+            r = self._handle_reset_computer_password(p)
+        else:
+            r = self._handle_delete_computer(p)
+        return self._com_ignorados(r, ignorados)
+
+    # ------------------------------------------------------------------ OUs
+    def _handle_search_ous(self, params: dict) -> dict:
+        if params.get("ou_dn"):
+            return self._handle_get_organizational_unit(params)
+        return self._handle_list_organizational_units(params)
+
+    def _handle_manage_ous(self, params: dict) -> dict:
+        tool = "ad_manage_organizational_units"
+        acao, recusa, ignorados = self._checar_acao(tool, params)
+        if recusa:
+            return recusa
+        p = dict(params)
+        if acao == "create":
+            p["additional_attributes"] = p.pop("attributes", None)
+            r = self._handle_create_organizational_unit(p)
+        elif acao == "update":
+            atributos = dict(p.get("attributes") or {})
+            for campo, ldap in (("description", "description"), ("managed_by", "managedBy")):
+                if p.get(campo):
+                    atributos.setdefault(ldap, p[campo])
+            r = self._atualizar_e_mover(
+                lambda: self._handle_modify_organizational_unit({**p, "attributes": atributos}),
+                lambda: self._handle_move_organizational_unit(
+                    {**p, "new_parent_dn": p["move_to_ou"]}), p, tool)
+        elif acao == "move":
+            r = self._handle_move_organizational_unit({**p, "new_parent_dn": p["move_to_ou"]})
+        else:
+            r = self._handle_delete_organizational_unit(p)
+        return self._com_ignorados(r, ignorados)
+
+    # ------------------------------------------------------------- security
+    def _handle_security_reports(self, params: dict) -> dict:
+        relatorio = params.get("report")
+        if relatorio == "user_permissions":
+            if not params.get("username"):
+                return {"sucesso": False, "erro": "PARAMETRO_OBRIGATORIO_AUSENTE",
+                        "tool": "ad_search_security_reports",
+                        "mensagem": "report='user_permissions' exige username. Nada foi executado.",
+                        "parametros_faltando": ["username"]}
+            return self._handle_get_user_permissions(params)
+        return {
+            "domain_policy": self._handle_get_domain_info,
+            "privileged_groups": self._handle_get_privileged_groups,
+            "admin_accounts": self._handle_audit_admin_accounts,
+            "password_violations": self._handle_get_password_policy_violations,
+        }[relatorio](params)
 
     def _handle_get_client_info(self, params: dict) -> dict:
         if self.security_manager:
@@ -1099,17 +1045,21 @@ class ActiveDirectoryMCPFastAPI:
             bundle, error = self.pool.resolve_or_error(client_name)
             if error is not None:
                 return {"exists": False, "searched_for": client_name, **error}
+            detalhes = next((s for s in self.pool.list_servers()["servidores"]
+                             if s.get("ad_server") == bundle.key), {})
             return {
                 "exists": True,
+                "ad_server": bundle.key,
                 "client": {
                     "slug": bundle.key,
                     "name": bundle.entry.label,
                     "domain": bundle.entry.domain,
                 },
-                "ad_server": bundle.key,
+                "servidor": detalhes,
                 "message": (
                     f"Cliente '{bundle.entry.label}' tem AD configurado. Use "
-                    f"ad_server='{bundle.key}'."
+                    f"ad_server='{bundle.key}' -- ou o proprio nome do cliente, que as "
+                    "demais tools tambem aceitam."
                 ),
             }
 
@@ -1160,11 +1110,18 @@ class ActiveDirectoryMCPFastAPI:
                                             params.get("client_confirmation"))
         if not perm.get("permitted"):
             return perm
-        result = self.user_tools.create_user(
+        # Top-level attributes were folded into additional_attributes by the
+        # sanitizer, before name resolution (see _dobrar_atributos_de_topo).
+        movidos = params.get("_lidos_como_atributos") or []
+        result = self._format_result(self.user_tools.create_user(
             params["username"], params["password"], params["first_name"], params["last_name"],
-            params.get("email"), params.get("ou"), params.get("additional_attributes")
-        )
-        return self._format_result(result)
+            params.get("email"), params.get("ou"), params.get("additional_attributes"),
+            must_change_password=params.get("must_change_password"),
+            copy_from_user=params.get("copy_from_user"),
+        ))
+        if movidos and isinstance(result, dict):
+            result["parametros_lidos_como_atributos"] = movidos
+        return result
 
     def _handle_modify_user(self, params: dict) -> dict:
         perm = self._check_write_permission("ad_modify_user_attributes", params["username"],
@@ -1190,7 +1147,8 @@ class ActiveDirectoryMCPFastAPI:
                                             params.get("client_confirmation"))
         if not perm.get("permitted"):
             return perm
-        result = self.user_tools.enable_user(params["username"])
+        result = self.user_tools.enable_user(params["username"],
+                                             move_to_ou=params.get("move_to_ou"))
         return self._format_result(result)
 
     def _handle_disable_user(self, params: dict) -> dict:
@@ -1199,7 +1157,9 @@ class ActiveDirectoryMCPFastAPI:
                                             params.get("client_confirmation"))
         if not perm.get("permitted"):
             return perm
-        result = self.user_tools.disable_user(params["username"])
+        result = self.user_tools.disable_user(
+            params["username"], move_to_ou=params.get("move_to_ou"),
+            remove_from_groups=params.get("remove_from_groups", False) is True)
         return self._format_result(result)
 
     def _handle_reset_user_password(self, params: dict) -> dict:
@@ -1214,10 +1174,6 @@ class ActiveDirectoryMCPFastAPI:
         )
         return self._format_result(result)
 
-    def _handle_get_user_groups(self, params: dict) -> dict:
-        result = self.user_tools.get_user_groups(params["username"])
-        return self._format_result(result)
-
     def _handle_list_groups(self, params: dict) -> dict:
         result = self.group_tools.list_groups(
             params.get("ou"), params.get("filter_criteria"), params.get("attributes")
@@ -1225,7 +1181,8 @@ class ActiveDirectoryMCPFastAPI:
         return self._format_result(result)
 
     def _handle_get_group(self, params: dict) -> dict:
-        result = self.group_tools.get_group(params["group_name"], params.get("attributes"))
+        result = self.group_tools.get_group(params["group_name"], params.get("attributes"),
+                                            recursive=params.get("recursive", False) is True)
         return self._format_result(result)
 
     def _handle_create_group(self, params: dict) -> dict:
@@ -1260,7 +1217,7 @@ class ActiveDirectoryMCPFastAPI:
         return self._format_result(result)
 
     def _handle_add_group_member(self, params: dict) -> dict:
-        perm = self._check_write_permission("ad_add_member_to_group", params["group_name"],
+        perm = self._check_write_permission("ad_add_member_to_group", str(params["group_name"]),
                                             params.get("automation_token"),
                                             params.get("client_confirmation"))
         if not perm.get("permitted"):
@@ -1269,16 +1226,12 @@ class ActiveDirectoryMCPFastAPI:
         return self._format_result(result)
 
     def _handle_remove_group_member(self, params: dict) -> dict:
-        perm = self._check_write_permission("ad_remove_member_from_group", params["group_name"],
+        perm = self._check_write_permission("ad_remove_member_from_group", str(params["group_name"]),
                                             params.get("automation_token"),
                                             params.get("client_confirmation"))
         if not perm.get("permitted"):
             return perm
         result = self.group_tools.remove_member(params["group_name"], params["member_dn"])
-        return self._format_result(result)
-
-    def _handle_get_group_members(self, params: dict) -> dict:
-        result = self.group_tools.get_members(params["group_name"], params.get("recursive", False))
         return self._format_result(result)
 
     def _handle_list_computers(self, params: dict) -> dict:
@@ -1360,7 +1313,8 @@ class ActiveDirectoryMCPFastAPI:
         return self._format_result(result)
 
     def _handle_get_organizational_unit(self, params: dict) -> dict:
-        result = self.ou_tools.get_ou(params["ou_dn"], params.get("attributes"))
+        result = self.ou_tools.get_ou(params["ou_dn"], params.get("attributes"),
+                                      object_types=params.get("object_types"))
         return self._format_result(result)
 
     def _handle_create_organizational_unit(self, params: dict) -> dict:
@@ -1390,20 +1344,31 @@ class ActiveDirectoryMCPFastAPI:
                                             params.get("client_confirmation"))
         if not perm.get("permitted"):
             return perm
-        result = self.ou_tools.delete_ou(params["ou_dn"], params.get("force", False))
+        result = self.ou_tools.delete_ou(params["ou_dn"], params.get("force", False) is True)
         return self._format_result(result)
 
     def _handle_move_organizational_unit(self, params: dict) -> dict:
-        perm = self._check_write_permission("ad_move_organizational_unit_parent", params["ou_dn"],
+        # object_name and ou_dn arrive here already resolved to DNs.
+        alvo = params.get("object_name") or params.get("ou_dn")
+        if not alvo:
+            return {
+                "sucesso": False,
+                "erro": "PARAMETRO_OBRIGATORIO_AUSENTE",
+                "mensagem": (
+                    "Informe o que mover: 'object_name' para um usuario, computador, grupo "
+                    "ou OU (por nome, login ou DN), ou 'ou_dn' para uma OU. O destino vai "
+                    "em 'new_parent_dn'."),
+                "parametros_faltando": ["object_name"],
+            }
+        perm = self._check_write_permission("ad_move_organizational_unit_parent", alvo,
                                             params.get("automation_token"),
                                             params.get("client_confirmation"))
         if not perm.get("permitted"):
             return perm
-        result = self.ou_tools.move_ou(params["ou_dn"], params["new_parent_dn"])
-        return self._format_result(result)
-
-    def _handle_get_organizational_unit_contents(self, params: dict) -> dict:
-        result = self.ou_tools.get_ou_contents(params["ou_dn"], params.get("object_types"))
+        # The legacy ou_dn path moves OUs only, as it always did; anything else
+        # goes through object_name, which says what it is moving.
+        result = self.ou_tools.move_object(alvo, params["new_parent_dn"],
+                                           only_ou=not params.get("object_name"))
         return self._format_result(result)
 
     def _handle_get_domain_info(self, params: dict) -> dict:
@@ -1433,10 +1398,36 @@ class ActiveDirectoryMCPFastAPI:
         return self._format_result(result)
 
     def _handle_test_connection(self, params: dict) -> dict:
+        """Live test of one directory -- also the health answer (tools merged).
+
+        A directory that does not answer comes back as FALHA_AO_CONSULTAR_O_AD
+        so a 'todos' run lists it under servidores_com_falha instead of
+        counting a {"connected": false} payload as a finding.
+        """
         try:
-            return self.ldap_manager.test_connection()
+            info = dict(self.ldap_manager.test_connection())
         except Exception as e:
-            return {"success": False, "error": str(e)}
+            info = {"connected": False, "error": str(e), "error_type": type(e).__name__}
+        cliente = None
+        if self.security_manager:
+            try:
+                cliente = self.security_manager.get_client_info()
+            except Exception:  # noqa: BLE001 - the connection answer stands alone
+                cliente = None
+        if not info.get("connected"):
+            falha = {
+                "sucesso": False,
+                "erro": "FALHA_AO_CONSULTAR_O_AD",
+                "mensagem": info.get("error") or "sem conexao com o controlador de dominio",
+                "detalhe": info,
+            }
+            if cliente:
+                falha["cliente"] = cliente
+            return falha
+        info["status"] = "ok" if info.get("search_test", True) else "degradado"
+        if cliente:
+            info["cliente"] = cliente
+        return info
 
     def _handle_health(self, params: dict) -> dict:
         if self.multi and self.pool is not None:
@@ -1496,26 +1487,6 @@ class ActiveDirectoryMCPFastAPI:
 
         return health_info
 
-    def _handle_get_schema_info(self, params: dict) -> dict:
-        info = {
-            "server": "ActiveDirectoryMCP-FastAPI",
-            "version": "1.1.0",
-            "transport": "streamable-http",
-            "mode": self.mode,
-            "multi_tenant": True,
-            "total_tools": len(self.tools),
-            "tools": list(self.tools.keys())
-        }
-        if self.multi:
-            info["ad_server_obrigatorio_em"] = sorted(
-                name for name, tool in self.tools.items() if not tool.get("global")
-            )
-            info["tools_sem_ad_server"] = sorted(
-                name for name, tool in self.tools.items() if tool.get("global")
-            )
-            info["total_servidores"] = len(self.pool.entries) if self.pool else 0
-        return info
-
     # ============= MCP PROTOCOL HANDLERS =============
 
     async def handle_initialize(self, params: dict) -> dict:
@@ -1529,18 +1500,24 @@ class ActiveDirectoryMCPFastAPI:
             "capabilities": {
                 "tools": {},
                 "prompts": {}
-            }
+            },
+            "instructions": INSTRUCOES_DO_SERVIDOR,
         }
 
     async def handle_tools_list(self, params: dict) -> dict:
         """Handle tools/list method."""
         tools_list = []
         for name, tool in self.tools.items():
-            tools_list.append({
+            if tool.get("oculta"):
+                continue
+            entrada = {
                 "name": name,
                 "description": tool["description"],
-                "inputSchema": tool["inputSchema"]
-            })
+                "inputSchema": tool["inputSchema"],
+            }
+            if tool.get("annotations"):
+                entrada["annotations"] = dict(tool["annotations"])
+            tools_list.append(entrada)
         return {"tools": tools_list}
 
     def _as_content(self, payload) -> dict:
@@ -1578,6 +1555,9 @@ class ActiveDirectoryMCPFastAPI:
     def _coagir(valor, tipos):
         """Best-effort conversion of a value to one of the schema's types."""
         if "array" in tipos and not isinstance(valor, list):
+            if isinstance(valor, str) and "string" in tipos \
+                    and not valor.strip().startswith("["):
+                return valor    # one name where one-or-many is accepted
             if isinstance(valor, str):
                 texto = valor.strip()
                 if texto.startswith("["):
@@ -1605,10 +1585,15 @@ class ActiveDirectoryMCPFastAPI:
             except ValueError:
                 pass
         if "boolean" in tipos and isinstance(valor, str):
-            if valor.strip().lower() in ("true", "sim", "yes", "1"):
+            texto = unicodedata.normalize("NFKD", valor.strip().lower().lstrip("$"))
+            texto = "".join(c for c in texto if not unicodedata.combining(c))
+            if texto in _VERDADEIROS:
                 return True
-            if valor.strip().lower() in ("false", "nao", "no", "0"):
+            if texto in _FALSOS:
                 return False
+        if "boolean" in tipos and isinstance(valor, int) and not isinstance(valor, bool) \
+                and valor in (0, 1):
+            return bool(valor)
         if "string" in tipos and isinstance(valor, list) and len(valor) == 1:
             return str(valor[0])
         if "string" in tipos and isinstance(valor, (int, float)) and "integer" not in tipos:
@@ -1650,21 +1635,46 @@ class ActiveDirectoryMCPFastAPI:
                 "tool": tool_name,
             }
 
+        args = dict(args)
+        if "action" in args and isinstance(args["action"], str):
+            args["action"] = self._normalizar_acao(args["action"])
+        if tool_name == "ad_manage_directory_users" and args.get("action") == "create":
+            args = self._dobrar_atributos_de_topo(args, propriedades)
+
         for chave, valor in args.items():
             spec = propriedades.get(chave)
             if spec is None:
                 # Unknown key: keep it, the handler reads by name and ignores it.
                 saneados[chave] = valor
                 continue
-            valor = self._coagir(valor, self._tipos_do_schema(spec))
-            if chave in self._CAMPOS_DE_LOGIN and isinstance(valor, str):
+            tipos = self._tipos_do_schema(spec)
+            valor = self._coagir(valor, tipos)
+            recusa = self._tipo_recusado(tool_name, chave, valor, tipos)
+            if recusa is not None:
+                return None, recusa
+            if spec.get("enum") and valor is not None:
+                valor, recusa = self._valor_do_enum(tool_name, chave, valor, spec["enum"])
+                if recusa is not None:
+                    return None, recusa
+            if "boolean" in tipos and (valor is None or (
+                    isinstance(valor, str) and valor.strip().lower() in ("", "null", "none"))):
+                continue        # "null" for a flag means "use the default"
+            # Only the NEW object's name is reduced to a login here. Everything
+            # that names an existing object goes to the resolver untouched: a DN
+            # or an e-mail identifies the object better than the login cut out
+            # of it, and cutting "CN=Full Name,..." yields a CN, not a login.
+            # A NEW user's login is never cut: "user@other-domain" or a DN from
+            # another tenant used to become an account here (audit 2026-09-19);
+            # UserTools.create_user refuses those shapes with an explanation.
+            if (chave in self._CAMPOS_DE_LOGIN and isinstance(valor, str)
+                    and nome_novo_de(tool_name, args) == chave and chave != "username"):
                 valor = self._extrair_login(valor)
             if isinstance(valor, str) and chave != "filter_criteria":
                 valor = valor.strip()
             saneados[chave] = valor
 
         faltando = [c for c in (schema.get("required") or [])
-                    if c not in saneados or saneados[c] in (None, "")]
+                    if c not in saneados or saneados[c] in (None, "", [])]
 
         if "ad_server" in faltando and tool.get("write"):
             # The specific message says WHY, which the generic one cannot.
@@ -1693,24 +1703,122 @@ class ActiveDirectoryMCPFastAPI:
                 "tool": tool_name,
             }
 
-        dias = saneados.get("days")
+        dias = saneados.get("days", saneados.get("inactive_days"))
         if dias is not None:
             if not isinstance(dias, int):
                 return None, {
                     "sucesso": False, "erro": "PARAMETRO_INVALIDO", "tool": tool_name,
-                    "mensagem": f"'days' precisa ser um numero inteiro; veio {dias!r}.",
+                    "mensagem": f"o numero de dias precisa ser inteiro; veio {dias!r}.",
                 }
             if dias <= 0 or dias > self._LIMITE_DIAS:
                 return None, {
                     "sucesso": False, "erro": "PARAMETRO_INVALIDO", "tool": tool_name,
                     "mensagem": (
-                        f"'days' precisa estar entre 1 e {self._LIMITE_DIAS}; veio {dias}. "
+                        f"o numero de dias precisa estar entre 1 e {self._LIMITE_DIAS}; veio {dias}. "
                         "Um valor negativo ou fora dessa faixa nao descreve um periodo."
                     ),
                 }
         return saneados, None
 
-    _CAMPOS_DN = ("ou", "parent_ou", "target_parent_dn", "source_dn", "ou_dn", "target_dn")
+    def _tipo_recusado(self, tool_name, chave, valor, tipos):
+        """Refuse a value the schema cannot mean, BEFORE anything is written.
+
+        @MX:WARN Any non-empty string is truthy in Python: "não", "off" or
+        "null" in remove_from_groups stripped every group, and force="não"
+        deleted an OU with everything inside (audit 2026-09-19). A flag is a
+        recognised boolean or it is refused; a single-value parameter never
+        takes a list, whose items would be resolved and then passed on raw.
+        @MX:REASON Guessing is only safe in the direction that changes nothing,
+        and that direction differs per flag, so the server does not guess.
+        """
+        if "boolean" in tipos and not isinstance(valor, bool) and valor is not None:
+            if isinstance(valor, str) and valor.strip().lower() in ("", "null", "none"):
+                return None
+            return {
+                "sucesso": False, "erro": "PARAMETRO_INVALIDO", "tool": tool_name,
+                "mensagem": (
+                    f"'{chave}' e sim/nao; veio {valor!r}. Use true ou false (aceitos tambem: "
+                    "sim, nao, on, off, 1, 0). Nada foi executado."),
+            }
+        if isinstance(valor, list) and "array" not in tipos:
+            return {
+                "sucesso": False, "erro": "PARAMETRO_INVALIDO", "tool": tool_name,
+                "mensagem": (
+                    f"'{chave}' recebe um unico valor; veio uma lista com {len(valor)} itens "
+                    f"({valor!r}). Nada foi executado."),
+            }
+        if isinstance(valor, dict) and "object" not in tipos:
+            return {
+                "sucesso": False, "erro": "PARAMETRO_INVALIDO", "tool": tool_name,
+                "mensagem": f"'{chave}' recebe texto; veio um objeto ({valor!r}). Nada foi executado.",
+            }
+        return None
+
+    # Words a model uses for an action; compared without case or accents.
+    _SINONIMOS_DE_ACAO = {
+        "criar": "create", "cadastrar": "create", "novo": "create",
+        "atualizar": "update", "alterar": "update", "editar": "update", "modificar": "update",
+        "modify": "update", "set": "update",
+        "mover": "move", "transferir": "move",
+        "ativar": "enable", "habilitar": "enable", "reativar": "enable", "desbloquear": "enable",
+        "desativar": "disable", "desabilitar": "disable", "bloquear": "disable",
+        "resetar_senha": "reset_password", "redefinir_senha": "reset_password",
+        "trocar_senha": "reset_password",
+        "reset_password_forced": "reset_password", "reset_computer_password": "reset_trust",
+        # "remover"/"remove"/"add"/"reset" are deliberately absent: on a group
+        # "remover" may mean the group or its members -- guessing could delete
+        # the group. An unknown word is refused with the accepted list.
+        "excluir": "delete", "apagar": "delete", "deletar": "delete",
+        "adicionar_membros": "add_members", "incluir_membros": "add_members",
+        "add_member": "add_members", "remover_membros": "remove_members",
+        "remove_member": "remove_members",
+    }
+
+    def _normalizar_acao(self, valor: str) -> str:
+        texto = unicodedata.normalize("NFKD", valor.strip().lower())
+        texto = "".join(c for c in texto if not unicodedata.combining(c))
+        texto = texto.replace("-", "_").replace(" ", "_")
+        return self._SINONIMOS_DE_ACAO.get(texto, texto)
+
+    @staticmethod
+    def _valor_do_enum(tool_name, chave, valor, opcoes):
+        """Canonical enum value (case-insensitive) or a refusal listing them all."""
+        if isinstance(valor, str):
+            for opcao in opcoes:
+                if opcao.lower() == valor.strip().lower():
+                    return opcao, None
+        return None, {
+            "sucesso": False, "erro": "PARAMETRO_INVALIDO", "tool": tool_name,
+            "mensagem": (f"'{chave}' nao aceita {valor!r}. Valores aceitos: "
+                         f"{', '.join(opcoes)}. Nada foi executado."),
+            "valores_aceitos": list(opcoes),
+        }
+
+    def _dobrar_atributos_de_topo(self, args, propriedades):
+        """Attributes sent beside the schema (department=..., Office=...) join
+        additional_attributes BEFORE name resolution, so a top-level manager
+        goes through the resolver like any other. They used to be dropped in
+        silence, and then (first fix) folded in after resolution, raw."""
+        conhecidos = UserTools._ALIASES_DE_ATRIBUTO.keys() | UserTools._OPCOES_DE_CRIACAO.keys() \
+            | {"country", "pais", "c", "co", "otherattributes"}
+        extras = args.get("attributes")
+        extras = dict(extras) if isinstance(extras, dict) else {}
+        movidos = []
+        for chave, valor in args.items():
+            if chave in propriedades:
+                continue
+            if UserTools._chave_simples(chave) in conhecidos:
+                extras.setdefault(chave, valor)
+                movidos.append(chave)
+        if not movidos:
+            return args
+        novos = {k: v for k, v in args.items() if k not in movidos}
+        novos["attributes"] = extras
+        novos["_lidos_como_atributos"] = movidos
+        return novos
+
+    _CAMPOS_DN = ("ou", "parent_ou", "target_parent_dn", "source_dn", "ou_dn", "target_dn",
+                  "move_to_ou", "new_parent_dn")
 
     def _validar_dn_no_dominio(self, tool_name, args, bundle):
         """A DN from another domain is a wrong-tenant call, not a search miss.
@@ -1764,12 +1872,89 @@ class ActiveDirectoryMCPFastAPI:
     # per-server summary instead of being silently cut.
     _LIMITE_RESPOSTA = 120_000
 
+    def _executar(self, tool_name, tool, handler, args, propagar_falha=False) -> dict:
+        """Resolve the call's identifiers against the bound directory, then run it.
+
+        @MX:ANCHOR The only way a handler runs: single mode, one server and
+        every-server calls all come through here.
+        @MX:REASON A handler reached any other way would receive what the model
+        typed ("Full Name", "Filial/Financeiro") where it expects a login or a
+        DN, which is the defect this resolver exists to remove.
+        """
+        base_dn = self.config.active_directory.base_dn
+        try:
+            args, recusa, identificacoes = resolver_argumentos(
+                tool_name, args, self.ldap_manager, base_dn,
+                escrita=self._is_write_tool(tool))
+        except Exception as exc:
+            if propagar_falha:
+                raise
+            self.logger.error("Resolucao falhou em %s: %s", tool_name, exc)
+            return {
+                "sucesso": False, "erro": "FALHA_AO_CONSULTAR_O_AD", "tool": tool_name,
+                "mensagem": (
+                    "Nao foi possivel consultar o Active Directory para localizar o objeto "
+                    f"informado ({type(exc).__name__}: {str(exc)[:200]}). Nada foi executado. "
+                    "Use ad_test_ldap_connection_status para verificar a conexao."),
+            }
+        if recusa is not None:
+            return recusa
+        resultado = handler(args)
+        if identificacoes and isinstance(resultado, dict):
+            resultado = dict(resultado)
+            resultado["identificacao"] = identificacoes
+        return resultado
+
+    def _classificar(self, chave, resultado, achados, vazios, falhas, parecidos, recusas):
+        """Sort one directory's answer into found / empty / failed."""
+        if self._eh_falha(resultado):
+            falhas.append({
+                "ad_server": chave,
+                "erro": resultado.get("erro") or resultado.get("type") or "FALHA",
+                "mensagem": (resultado.get("mensagem") or resultado.get("error")
+                             or "falha sem detalhe")[:400],
+            })
+        elif self._tem_resultado(resultado):
+            achados[chave] = resultado
+        else:
+            vazios.append(chave)
+            if isinstance(resultado, dict) and resultado.get("parecidos"):
+                parecidos[chave] = resultado["parecidos"]
+            if isinstance(resultado, dict) and resultado.get("erro") in self._RECUSAS_DE_ENTRADA:
+                recusas[chave] = resultado
+
+    @staticmethod
+    def _eh_falha(payload) -> bool:
+        """A directory that could not be asked is a failure, not an empty answer.
+
+        Tools report exceptions as {"success": false, "error": ..., "type": <class>};
+        counting that as "sem resultado" told the model a directory that was
+        unreachable simply did not have the person.
+        """
+        if not isinstance(payload, dict):
+            return False
+        if payload.get("erro") in ("FALHA_AO_CONSULTAR_O_AD", "TEMPO_ESGOTADO"):
+            return True
+        return payload.get("success") is False and bool(payload.get("type"))
+
+    # A connectivity test is about every directory, not about finding one
+    # object: cutting the slow ones after the first answer hid the real error
+    # (VPN down, DC off) behind a generic TEMPO_ESGOTADO.
+    _SEM_GRACA = {"ad_test_ldap_connection_status"}
+
+    # Refusals that depend on the input, not on the directory's content.
+    _RECUSAS_DE_ENTRADA = {"FILTRO_LDAP_INVALIDO", "PARAMETRO_INVALIDO", "OBJETO_FORA_DO_DOMINIO"}
+
     @staticmethod
     def _tem_resultado(payload) -> bool:
         """Whether a per-server payload actually found something."""
         if not isinstance(payload, dict):
             return bool(payload)
-        if payload.get("success") is False or "error" in payload:
+        if payload.get("erro") == "IDENTIFICACAO_AMBIGUA":
+            # Candidates ARE a finding: dropping them would report "nothing
+            # here" for a directory that holds several matching objects.
+            return True
+        if payload.get("success") is False or "error" in payload or "erro" in payload:
             return False
         for chave, valor in payload.items():
             if isinstance(valor, list):
@@ -1779,32 +1964,91 @@ class ActiveDirectoryMCPFastAPI:
         return True
 
     async def _executar_em_todos(self, tool_name, handler, tool_args, pedido) -> dict:
-        """Run a read tool against every enabled directory and merge the answers.
+        """Run a read tool against every enabled directory, in parallel, and merge.
 
         @MX:ANCHOR A server that fails is listed, never dropped: an omitted
         directory reads as "nothing there", which is a different -- and false --
         statement from "could not look".
+        @MX:REASON Measured 2026-09-19: sequential, one directory with its VPN
+        down cost 32 s each and pushed every "todos" call past the client's 30 s.
+        All directories now run at once; once one of them finds the object the
+        others get _GRACA_APOS_ACHADO more seconds, because the same name in a
+        second customer's AD must still be reported -- stopping at the first hit
+        would let a write land on the wrong customer.
         """
-        achados, vazios, falhas = {}, [], []
+        achados, vazios, falhas, parecidos, recusas = {}, [], [], {}, {}
+        tool = self.tools[tool_name]
+        loop = asyncio.get_running_loop()
+        inicio = loop.time()
 
+        por_futuro = {}
         for chave in self.pool.available_names():
             bundle, error = self.pool.resolve_or_error(chave)
             if error is not None:
                 falhas.append({"ad_server": chave, "erro": error.get("erro"),
                                "mensagem": error.get("mensagem")})
                 continue
-            try:
-                async with self._bind_lock:
-                    with self._bound(bundle):
-                        resultado = handler(dict(tool_args))
-            except Exception as exc:
-                falhas.append({"ad_server": chave, "erro": type(exc).__name__,
-                               "mensagem": str(exc)[:200]})
-                continue
-            if self._tem_resultado(resultado):
-                achados[chave] = resultado
-            else:
-                vazios.append(chave)
+
+            def trabalho(b=bundle):
+                with self._bound(b):
+                    return self._executar(tool_name, tool, handler, dict(tool_args),
+                                          propagar_falha=True)
+
+            por_futuro[loop.run_in_executor(self._executor(), trabalho)] = chave
+
+        limite = inicio + self._PRAZO_TODOS
+        pendentes = set(por_futuro)
+        while pendentes:
+            espera = limite - loop.time()
+            if espera <= 0:
+                break
+            prontos, pendentes = await asyncio.wait(
+                pendentes, timeout=espera, return_when=asyncio.FIRST_COMPLETED)
+            for futuro in prontos:
+                chave = por_futuro[futuro]
+                try:
+                    resultado = futuro.result()
+                except Exception as exc:
+                    falhas.append({"ad_server": chave, "erro": type(exc).__name__,
+                                   "mensagem": (str(exc) or type(exc).__name__)[:400]})
+                    continue
+                self._classificar(chave, resultado, achados, vazios, falhas, parecidos,
+                                  recusas)
+            if achados and tool_name not in self._SEM_GRACA:
+                # A directory still opening its first connection has not had a
+                # chance to answer yet: cutting it after the grace reported
+                # "tempo esgotado" for healthy customers (measured 2026-09-21).
+                frios = [c for f, c in por_futuro.items()
+                         if f in pendentes and not self.pool.esta_conectado(c)]
+                prazo = self._PRAZO_CONEXAO_FRIA if frios else self._GRACA_APOS_ACHADO
+                limite = min(limite, loop.time() + prazo)
+
+        for futuro in pendentes:
+            chave = por_futuro[futuro]
+            frio = not self.pool.esta_conectado(chave)
+            prazo = self._PRAZO_TODOS if (not achados or tool_name in self._SEM_GRACA) \
+                else (self._PRAZO_CONEXAO_FRIA if frio else self._GRACA_APOS_ACHADO)
+            falhas.append({
+                "ad_server": chave, "erro": "TEMPO_ESGOTADO",
+                "mensagem": (
+                    f"Nao respondeu a tempo ({prazo:.0f}s"
+                    + (" apos o primeiro resultado" if achados else "")
+                    + (", e a conexao com ele ainda estava sendo aberta" if frio else "")
+                    + "). O que este AD contem NAO foi verificado; consulte-o sozinho "
+                      "informando ad_server se precisar."),
+            })
+        falhas.sort(key=lambda f: f["ad_server"])
+
+        # An input refusal is not "nothing here": when every directory refused
+        # the same input (an invalid filter is invalid everywhere), the refusal
+        # IS the answer. Reporting "found in 0 of 8" hid it from the model.
+        if not achados and vazios and len(recusas) == len(vazios) \
+                and len({r["erro"] for r in recusas.values()}) == 1:
+            recusa = dict(next(iter(recusas.values())))
+            recusa["servidores_consultados"] = len(vazios) + len(falhas)
+            if falhas:
+                recusa["servidores_com_falha"] = falhas
+            return recusa
 
         consultados = len(achados) + len(vazios) + len(falhas)
         resposta = {
@@ -1815,6 +2059,12 @@ class ActiveDirectoryMCPFastAPI:
             "sem_resultado_em": sorted(vazios),
             "resultados_por_servidor": achados,
         }
+        if not achados and parecidos:
+            resposta["parecidos_por_servidor"] = parecidos
+            resposta["nota_parecidos"] = (
+                "Nada corresponde ao nome informado, mas estes objetos tem nome proximo. "
+                "Se um deles for o pretendido, repita a chamada com o login dele e o "
+                "ad_server onde foi encontrado.")
         if falhas:
             resposta["servidores_com_falha"] = falhas
             resposta["aviso"] = (
@@ -1827,6 +2077,7 @@ class ActiveDirectoryMCPFastAPI:
                 "'ad_server' nao foi informado, entao a busca rodou em todos os ADs. "
                 "Para consultar um so, informe o nome do servidor."
             )
+        resposta["tempo_s"] = round(loop.time() - inicio, 1)
         resposta["resumo"] = (
             f"Encontrado em {len(achados)} de {consultados} servidores"
             + (f": {', '.join(sorted(achados))}." if achados else ".")
@@ -1838,7 +2089,7 @@ class ActiveDirectoryMCPFastAPI:
             for chave, payload in achados.items():
                 if isinstance(payload, dict):
                     resumo_por_servidor[chave] = {
-                        k: (len(v) if isinstance(v, list) else v)
+                        k: (v if k == "identificacao" else len(v) if isinstance(v, list) else v)
                         for k, v in payload.items()
                         if isinstance(v, (int, str, bool)) or isinstance(v, list)
                     }
@@ -1853,7 +2104,146 @@ class ActiveDirectoryMCPFastAPI:
             )
         return resposta
 
+    # Tools merged into others on 2026-09-19. The old names keep answering --
+    # a client or saved prompt that still calls them gets the new tool's
+    # answer plus a note -- but they are no longer listed: seven near-twins in
+    # the catalogue were seven chances for the hub's search to pick a partial
+    # tool. old -> (new, {old argument: new argument}).
+    # Every name this server ever listed, mapped onto the 10-tool catalogue of
+    # 2026-09-19: old -> (new tool, {old arg: new arg}, {fixed arg: value}).
+    # A client connected directly (or a saved prompt) keeps working and gets a
+    # 'tool_unificada' note; a gateway that only routes listed tools (mcphub)
+    # answers "tool not available" and the model searches again.
+    _U, _G, _C, _O = ("ad_manage_directory_users", "ad_manage_directory_groups",
+                      "ad_manage_directory_computers", "ad_manage_organizational_units")
+    ALIASES_DE_TOOLS = {
+        # catalogue and diagnostics
+        "ad_list_ad_servers": ("ad_search_directory_servers", {}, {}),
+        "ad_check_ad_server_configured": ("ad_search_directory_servers",
+                                          {"client_name": "server_name"}, {}),
+        "ad_check_client_configuration": ("ad_search_directory_servers",
+                                          {"client_name": "server_name"}, {}),
+        "ad_list_configured_clients": ("ad_search_directory_servers", {}, {}),
+        "ad_get_client_tenant_info": ("ad_search_directory_servers",
+                                      {"ad_server": "server_name"}, {}),
+        "ad_health_check_mcp_server": ("ad_search_directory_servers", {},
+                                       {"test_connection": True}),
+        "ad_get_mcp_schema_tools_info": ("ad_search_directory_servers", {}, {}),
+        # users
+        "ad_list_users_with_filters": ("ad_search_directory_users", {}, {}),
+        "ad_get_user_details_by_username": ("ad_search_directory_users", {}, {}),
+        "ad_get_user_group_memberships": ("ad_search_directory_users", {}, {}),
+        # the old tools defaulted to 90 days; without it the call would
+        # silently become "list everyone" (audit 2026-09-21)
+        "ad_get_inactive_users_by_days": ("ad_search_directory_users",
+                                          {"days": "inactive_days"}, {}, {"inactive_days": 90}),
+        "ad_create_user_account": (_U, {"additional_attributes": "attributes"},
+                                   {"action": "create"}),
+        "ad_modify_user_attributes": (_U, {}, {"action": "update"}),
+        "ad_delete_user_account_permanently": (_U, {}, {"action": "delete"}),
+        "ad_enable_user_account_access": (_U, {}, {"action": "enable"}),
+        "ad_disable_user_account_access": (_U, {}, {"action": "disable"}),
+        "ad_reset_user_password_forced": (_U, {"new_password": "password",
+                                               "force_change": "must_change_password"},
+                                          {"action": "reset_password"}),
+        # groups
+        "ad_list_groups_with_filters": ("ad_search_directory_groups", {}, {}),
+        "ad_get_group_details_by_name": ("ad_search_directory_groups", {}, {}),
+        "ad_get_group_members_recursive": ("ad_search_directory_groups", {}, {}),
+        "ad_create_group_security_or_distribution": (
+            _G, {"additional_attributes": "attributes"}, {"action": "create"}),
+        "ad_modify_group_attributes": (_G, {}, {"action": "update"}),
+        "ad_delete_group_permanently": (_G, {}, {"action": "delete"}),
+        "ad_add_member_to_group": (_G, {"member_dn": "members"}, {"action": "add_members"}),
+        "ad_remove_member_from_group": (_G, {"member_dn": "members"},
+                                        {"action": "remove_members"}),
+        # computers
+        "ad_list_computers_with_filters": ("ad_search_directory_computers", {}, {}),
+        "ad_get_computer_details_by_name": ("ad_search_directory_computers", {}, {}),
+        "ad_get_inactive_computers_by_days": ("ad_search_directory_computers",
+                                              {"days": "inactive_days"}, {},
+                                              {"inactive_days": 90}),
+        "ad_create_computer_account": (_C, {"additional_attributes": "attributes"},
+                                       {"action": "create"}),
+        "ad_modify_computer_attributes": (_C, {}, {"action": "update"}),
+        "ad_delete_computer_account_permanently": (_C, {}, {"action": "delete"}),
+        "ad_enable_computer_account_trust": (_C, {}, {"action": "enable"}),
+        "ad_disable_computer_account_trust": (_C, {}, {"action": "disable"}),
+        "ad_reset_computer_password_trust": (_C, {}, {"action": "reset_trust"}),
+        # organizational units
+        "ad_list_organizational_units_hierarchy": ("ad_search_organizational_units", {}, {}),
+        "ad_get_organizational_unit_details": ("ad_search_organizational_units", {}, {}),
+        "ad_get_organizational_unit_objects": ("ad_search_organizational_units", {}, {}),
+        "ad_create_organizational_unit": (_O, {"additional_attributes": "attributes"},
+                                          {"action": "create"}),
+        "ad_modify_organizational_unit_attributes": (_O, {}, {"action": "update"}),
+        "ad_delete_organizational_unit_forced": (_O, {}, {"action": "delete"}),
+        # security
+        "ad_get_domain_security_policy_info": ("ad_search_security_reports", {},
+                                               {"report": "domain_policy"}),
+        "ad_get_privileged_security_groups": ("ad_search_security_reports", {},
+                                              {"report": "privileged_groups"}),
+        "ad_get_user_effective_permissions": ("ad_search_security_reports", {},
+                                              {"report": "user_permissions"}),
+        "ad_get_password_policy_violations": ("ad_search_security_reports", {},
+                                              {"report": "password_violations"}),
+        "ad_audit_administrative_accounts": ("ad_search_security_reports", {},
+                                             {"report": "admin_accounts"}),
+    }
+
+    @classmethod
+    def _alias(cls, nome):
+        """(new tool, renames, fixed args, defaults) -- defaults only apply
+        when the caller left the value out."""
+        entrada = cls.ALIASES_DE_TOOLS[nome]
+        return entrada if len(entrada) == 4 else (*entrada, {})
+
+    def _aplicar_alias(self, tool_name, tool_args):
+        """Map a merged tool's name (hub prefix allowed) to its replacement."""
+        nome = str(tool_name or "")
+        for prefixo in ("ad-multi-", "ad_multi_", "mcp__ad-multi__", "ad-multi."):
+            if nome.startswith(prefixo):
+                nome = nome[len(prefixo):]
+        if nome in self.tools or nome not in self.ALIASES_DE_TOOLS:
+            return tool_name, tool_args, None
+        nova, renomes, fixos, padroes = self._alias(nome)
+        if nova not in self.tools:
+            return tool_name, tool_args, None
+        novos = {}
+        for chave, valor in tool_args.items():
+            novos[renomes.get(chave, chave)] = valor
+        novos.update(fixos)
+        for chave, valor in padroes.items():
+            novos.setdefault(chave, valor)
+        # Unknown keys are kept on purpose: create folds the attributes a model
+        # sends at the top level (department=..., Office=...) into attributes,
+        # and filtering here dropped them before that could happen.
+        self.logger.info("tools/call %s -> alias de %s", nome, nova)
+        return nova, novos, (
+            f"A tool '{nome}' foi unificada em '{nova}', que respondeu esta chamada. "
+            f"Use '{nova}' diretamente.")
+
     async def handle_tools_call(self, params: dict) -> dict:
+        """Route a call, translating the names of merged tools first."""
+        bruto = params.get("arguments")
+        if isinstance(bruto, str):
+            try:
+                bruto = json.loads(bruto)
+            except (ValueError, TypeError):
+                bruto = {}
+        nome, args, nota = self._aplicar_alias(params.get("name"), dict(bruto or {}))
+        resposta = await self._tools_call(dict(params, name=nome, arguments=args))
+        if nota:
+            try:
+                payload = json.loads(resposta["content"][0]["text"])
+                if isinstance(payload, dict):
+                    payload = {"tool_unificada": nota, **payload}
+                    resposta = self._as_content(payload)
+            except (KeyError, IndexError, ValueError, TypeError):
+                pass
+        return resposta
+
+    async def _tools_call(self, params: dict) -> dict:
         """Handle tools/call method.
 
         In multi-AD mode this is the single place where a call is routed to a
@@ -1878,6 +2268,16 @@ class ActiveDirectoryMCPFastAPI:
 
         tool = self.tools[tool_name]
         handler = tool["handler"]
+
+        if tool_name == "ad_search_directory_servers" and \
+                str(tool_args.get("test_connection")).strip().lower() in _VERDADEIROS:
+            # The live connection test runs per directory, like any read:
+            # server_name (or none = every directory) becomes the routing key.
+            alvo = tool_args.get("server_name")
+            tool_name, tool = "ad_test_ldap_connection_status", \
+                self.tools["ad_test_ldap_connection_status"]
+            handler = tool["handler"]
+            tool_args = {"ad_server": alvo} if (self.multi and alvo) else {}
 
         tool_args, recusa = self._sanear_argumentos(tool_name, tool, tool_args)
         if recusa is not None:
@@ -1916,19 +2316,46 @@ class ActiveDirectoryMCPFastAPI:
                 )
                 return self._as_content(error)
 
-            # @MX:WARN The tenant is bound onto self for the duration of the
-            # handler. The lock keeps exactly one tenant bound at a time; drop it
-            # and a future async handler could observe another customer's AD.
             recusa = self._validar_dn_no_dominio(tool_name, tool_args, bundle)
             if recusa is not None:
                 return self._as_content(recusa)
 
-            async with self._bind_lock:
-                with self._bound(bundle):
-                    self.logger.info("tools/call %s -> ad_server=%s", tool_name, bundle.key)
-                    result = handler(tool_args)
+            # The directory is bound to the worker thread that runs the call, so
+            # concurrent calls to different customers never share state. Reads on
+            # one directory run in parallel; writes on one directory run one at a
+            # time, as they did when the whole server was serial.
+            escrita = self._is_write_tool(tool)
+
+            def trabalho():
+                trava = self._trava_de_escrita(bundle.key) if escrita else None
+                espera = max(0.1, self._PRAZO_CHAMADA * 0.8)
+                if trava is not None and not trava.acquire(timeout=espera):
+                    return {
+                        "sucesso": False, "erro": "AD_OCUPADO", "tool": tool_name,
+                        "mensagem": (
+                            "Outra alteracao neste AD ainda esta em andamento. Nada foi "
+                            "executado; repita em instantes."),
+                    }
+                try:
+                    with self._bound(bundle):
+                        self.logger.info("tools/call %s -> ad_server=%s", tool_name,
+                                         bundle.key)
+                        return self._executar(tool_name, tool, handler, tool_args)
+                finally:
+                    if trava is not None:
+                        trava.release()
+
+            result = await self._em_thread(trabalho, self._PRAZO_CHAMADA, tool_name,
+                                           escrita=escrita, ad_server=bundle.key)
+            if isinstance(result, dict) and result.get("sucesso") is False:
+                result.setdefault("ad_server", bundle.key)
+        elif tool.get("global"):
+            result = await self._em_thread(lambda: handler(tool_args), self._PRAZO_CHAMADA,
+                                           tool_name)
         else:
-            result = handler(tool_args)
+            result = await self._em_thread(
+                lambda: self._executar(tool_name, tool, handler, tool_args),
+                self._PRAZO_CHAMADA, tool_name, escrita=self._is_write_tool(tool))
 
         return self._as_content(result)
 
@@ -1958,8 +2385,18 @@ class ActiveDirectoryMCPFastAPI:
             ldap_manager = bundle.ldap_manager
             prompt_args = {k: v for k, v in prompt_args.items() if k != "ad_server"}
 
-        result = await handle_get_prompt(prompt_name, prompt_args, ldap_manager)
-        return result
+        # Prompt builders query LDAP synchronously; off the event loop, with the
+        # same deadline as a tool call.
+        loop = asyncio.get_running_loop()
+        futuro = loop.run_in_executor(
+            self._executor(),
+            lambda: asyncio.run(handle_get_prompt(prompt_name, prompt_args, ldap_manager)))
+        try:
+            return await asyncio.wait_for(asyncio.shield(futuro), timeout=self._PRAZO_CHAMADA)
+        except asyncio.TimeoutError as exc:
+            raise ValueError(
+                f"O Active Directory nao respondeu em {self._PRAZO_CHAMADA:.0f}s ao montar o "
+                f"prompt {prompt_name}.") from exc
 
     async def handle_request(self, request_data: dict) -> dict:
         """Handle MCP JSON-RPC request."""
@@ -2098,8 +2535,21 @@ class ActiveDirectoryMCPFastAPI:
         elif self.ldap_manager is not None:
             self.ldap_manager.disconnect()
 
+    def _aquecer_conexoes(self) -> None:
+        """Open every connection in the background (see ADServerPool.aquecer).
+
+        Called when the process starts serving, never on construction: a test
+        that only builds the server must not dial eight directories.
+        """
+        if not self.multi or self.pool is None:
+            return
+        if os.getenv("AD_MCP_AQUECER", "1").strip().lower() in ("0", "false", "nao", "no"):
+            return
+        self.pool.aquecer()
+
     def run(self):
         """Start the server."""
+        self._aquecer_conexoes()
         uvicorn.run(
             self.app,
             host=self.host,
