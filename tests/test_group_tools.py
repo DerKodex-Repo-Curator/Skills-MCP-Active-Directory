@@ -119,8 +119,17 @@ class TestGroupTools:
             }
         ]
         
-        mock_ldap_manager.search.return_value = mock_results
-        
+        membros = [
+            {'dn': 'CN=John Doe,OU=Users,DC=test,DC=local',
+             'attributes': {'objectClass': ['top', 'person', 'user'], 'sAMAccountName': 'jdoe',
+                            'name': 'John Doe', 'userAccountControl': 512}},
+            {'dn': 'CN=Jane Smith,OU=Users,DC=test,DC=local',
+             'attributes': {'objectClass': ['top', 'person', 'user'], 'sAMAccountName': 'jsmith',
+                            'name': 'Jane Smith', 'userAccountControl': 514}},
+        ]
+        # group lookup, then ONE (memberOf=<group>) search for the members
+        mock_ldap_manager.search.side_effect = [mock_results, membros]
+
         # Test get_group
         result = group_tools.get_group('SalesTeam')
         
@@ -140,10 +149,15 @@ class TestGroupTools:
         assert computed['member_count'] == 2
         assert computed['parent_groups_count'] == 1
         
+        # sorted by name: Jane Smith, John Doe
+        assert [m['login'] for m in response_data['members']] == ['jsmith', 'jdoe']
+        assert [m['enabled'] for m in response_data['members']] == [False, True]
         # Verify LDAP search was called with correct filter
-        mock_ldap_manager.search.assert_called_once()
-        call_args = mock_ldap_manager.search.call_args
+        assert mock_ldap_manager.search.call_count == 2
+        call_args = mock_ldap_manager.search.call_args_list[0]
         assert 'sAMAccountName=SalesTeam' in call_args[1]['search_filter']
+        assert 'memberOf=CN=Sales Team' in \
+            mock_ldap_manager.search.call_args_list[1][1]['search_filter']
     
     def test_get_group_not_found(self, group_tools, mock_ldap_manager):
         """Test group not found scenario."""
@@ -278,20 +292,19 @@ class TestGroupTools:
     def test_add_member_success(self, group_tools, mock_ldap_manager):
         """Test successful member addition to group."""
         # Mock search for group
-        mock_ldap_manager.search.return_value = [
-            {
-                'dn': 'CN=Test Group,OU=Groups,DC=test,DC=local',
-                'attributes': {
-                    'member': ['CN=Existing Member,OU=Users,DC=test,DC=local']
-                }
-            }
+        member_dn = 'CN=New Member,OU=Users,DC=test,DC=local'
+        existente = 'CN=Existing Member,OU=Users,DC=test,DC=local'
+        grupo = 'CN=Test Group,OU=Groups,DC=test,DC=local'
+        # the group before the change, then the read-back that proves it
+        mock_ldap_manager.search.side_effect = [
+            [{'dn': grupo, 'attributes': {'member': [existente]}}],
+            [{'dn': grupo, 'attributes': {'member': [existente, member_dn]}}],
         ]
         
         # Mock successful modify operation
         mock_ldap_manager.modify.return_value = True
         
         # Test add_member
-        member_dn = 'CN=New Member,OU=Users,DC=test,DC=local'
         result = group_tools.add_member('TestGroup', member_dn)
         
         # Verify result
@@ -301,8 +314,9 @@ class TestGroupTools:
         # Parse JSON response
         response_data = json.loads(result[0].text)
         assert response_data['success'] == True
-        assert 'Member added' in response_data['message']
+        assert 'incluido' in response_data['message']
         assert response_data['member_dn'] == member_dn
+        assert response_data['resultados'][0]['verified'] is True
         
         # Verify LDAP modify was called with MODIFY_ADD
         mock_ldap_manager.modify.assert_called_once()
@@ -330,8 +344,9 @@ class TestGroupTools:
         
         # Parse JSON response
         response_data = json.loads(result[0].text)
-        assert response_data['success'] == False
-        assert 'already in group' in response_data['error']
+        # Idempotent: repeating an add is not a failure.
+        assert response_data['success'] == True
+        assert response_data['resultados'][0]['status'] == 'ja_era_membro'
         
         # Verify no modify operation was called
         mock_ldap_manager.modify.assert_not_called()
@@ -341,16 +356,11 @@ class TestGroupTools:
         member_dn = 'CN=Member To Remove,OU=Users,DC=test,DC=local'
         
         # Mock search for group
-        mock_ldap_manager.search.return_value = [
-            {
-                'dn': 'CN=Test Group,OU=Groups,DC=test,DC=local',
-                'attributes': {
-                    'member': [
-                        member_dn,
-                        'CN=Other Member,OU=Users,DC=test,DC=local'
-                    ]
-                }
-            }
+        outro = 'CN=Other Member,OU=Users,DC=test,DC=local'
+        grupo = 'CN=Test Group,OU=Groups,DC=test,DC=local'
+        mock_ldap_manager.search.side_effect = [
+            [{'dn': grupo, 'attributes': {'member': [member_dn, outro]}}],
+            [{'dn': grupo, 'attributes': {'member': [outro]}}],
         ]
         
         # Mock successful modify operation
@@ -366,7 +376,8 @@ class TestGroupTools:
         # Parse JSON response
         response_data = json.loads(result[0].text)
         assert response_data['success'] == True
-        assert 'Member removed' in response_data['message']
+        assert 'removido' in response_data['message']
+        assert response_data['resultados'][0]['verified'] is True
         
         # Verify LDAP modify was called with MODIFY_DELETE
         mock_ldap_manager.modify.assert_called_once()

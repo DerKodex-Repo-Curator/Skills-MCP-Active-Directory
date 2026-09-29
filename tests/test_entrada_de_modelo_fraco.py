@@ -22,6 +22,8 @@ import pytest
 
 from active_directory_mcp.server_fastapi import ActiveDirectoryMCPFastAPI
 
+from .diretorio_falso import DiretorioFalso, usuario
+
 
 @pytest.fixture
 def servidor(tmp_path):
@@ -38,10 +40,25 @@ def servidor(tmp_path):
     }
     caminho = tmp_path / "s.json"
     caminho.write_text(json.dumps({"version": 1, "servers": {"alfa": bloco}}), encoding="utf-8")
-    return ActiveDirectoryMCPFastAPI(port=0, servers_path=str(caminho), mode="multi")
+    srv = ActiveDirectoryMCPFastAPI(port=0, servers_path=str(caminho), mode="multi")
+    # Identifiers are resolved against the directory before the handler runs,
+    # so even a spied handler needs one to look the account up in.
+    bundle, erro = srv.pool.resolve_or_error("alfa")
+    assert erro is None, erro
+    bundle.ldap_manager = DiretorioFalso("DC=alfa,DC=local", [
+        usuario("Joao Silva", "joao.silva", "CN=Users,DC=alfa,DC=local"),
+    ])
+    return srv
+
+
+def _alvo(servidor, nome):
+    """A tool name merged into another (2026-09-19) resolves to its replacement."""
+    return nome if nome in servidor.tools else servidor.ALIASES_DE_TOOLS.get(nome, (nome,))[0]
 
 
 def chamar(servidor, nome, **args):
+    if servidor.tools.get(_alvo(servidor, nome), {}).get("write"):
+        args.setdefault("client_confirmation", "alfa")
     r = asyncio.run(servidor.handle_tools_call({"name": nome, "arguments": args}))
     return json.loads(r["content"][0]["text"])
 
@@ -54,7 +71,7 @@ def espiar(servidor, tool_name):
         visto.update(params)
         return {"ok": True}
 
-    servidor.tools[tool_name]["handler"] = spy
+    servidor.tools[_alvo(servidor, tool_name)]["handler"] = spy
     return visto
 
 
@@ -67,9 +84,9 @@ def test_lista_de_um_elemento_no_ad_server(servidor):
 
 
 def test_inteiro_como_string(servidor):
-    visto = espiar(servidor, "ad_get_inactive_users_by_days")
-    chamar(servidor, "ad_get_inactive_users_by_days", ad_server="alfa", days="90")
-    assert visto["days"] == 90 and isinstance(visto["days"], int)
+    visto = espiar(servidor, "ad_search_directory_users")
+    chamar(servidor, "ad_search_directory_users", ad_server="alfa", inactive_days="90")
+    assert visto["inactive_days"] == 90 and isinstance(visto["inactive_days"], int)
 
 
 def test_lista_como_string_json(servidor):
@@ -110,17 +127,37 @@ def test_objeto_como_string_json(servidor):
 def test_username_em_qualquer_formato_vira_o_login(servidor, entrada):
     visto = espiar(servidor, "ad_get_user_details_by_username")
     chamar(servidor, "ad_get_user_details_by_username", ad_server="alfa", username=entrada)
-    assert visto["username"] in ("joao.silva", "Joao Silva"), visto
+    # "Joao Silva" (the CN cut out of the DN) used to be accepted here -- and
+    # it is not a login: every tool then searched sAMAccountName for it.
+    assert visto["username"] == "joao.silva", visto
 
 
 # ------------------------------------------------------- recusas com instrucao
 
 def test_parametro_obrigatorio_ausente_explica_o_que_falta(servidor):
-    r = chamar(servidor, "ad_get_user_details_by_username", ad_server="alfa")
+    r = chamar(servidor, "ad_manage_directory_users", ad_server="alfa", action="disable")
     assert r["sucesso"] is False
     assert r["erro"] == "PARAMETRO_OBRIGATORIO_AUSENTE"
     assert "username" in r["parametros_faltando"]
     assert "username" in r["mensagem"]
+
+
+def test_action_desconhecida_lista_as_aceitas(servidor):
+    r = chamar(servidor, "ad_manage_directory_users", ad_server="alfa", action="incinerar",
+               username="sabrina.rocha")
+    assert r["erro"] == "PARAMETRO_INVALIDO" and "disable" in r["mensagem"]
+    assert "delete" in r["valores_aceitos"]
+
+
+@pytest.mark.parametrize("escrito,esperado", [
+    ("desativar", "disable"), ("Criar", "create"), ("excluir", "delete"),
+    ("reset_password", "reset_password"), ("ENABLE", "enable"),
+])
+def test_action_em_portugues_e_entendida(servidor, escrito, esperado):
+    visto = espiar(servidor, "ad_manage_directory_users")
+    chamar(servidor, "ad_manage_directory_users", ad_server="alfa", action=escrito,
+           username="joao.silva")
+    assert visto["action"] == esperado
 
 
 def test_dias_negativos_sao_recusados(servidor):

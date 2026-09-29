@@ -69,7 +69,7 @@ class TestServerIntegration:
         assert server.security_tools is not None
         
         # Verify MCP server setup
-        assert server.mcp is not None
+        assert server.app is not None   # stdio transport over the shared catalogue
         
         # Test connection was called
         mock_test_connection.assert_called_once()
@@ -123,7 +123,7 @@ class TestServerIntegration:
         
         # Get registered tools (this would require access to FastMCP internals)
         # For now, just verify the server initialized without errors
-        assert server.mcp is not None
+        assert server.app is not None   # stdio transport over the shared catalogue
     
     @patch('active_directory_mcp.core.ldap_manager.LDAPManager.test_connection')
     def test_connection_failure_handling(self, mock_test_connection, config_file):
@@ -334,8 +334,16 @@ class TestEndToEndWorkflows:
         modify_data = json.loads(modify_result[0].text)
         assert modify_data['success'] == True
         
-        # 3. Add user to group
+        # 3. Add user to group. add_member re-reads the group to prove the
+        # change, so for this step the mock has to hold the state it was given.
+        membros = []
+        busca_anterior = mock_search.side_effect
+        mock_modify.side_effect = lambda dn, changes: membros.extend(
+            v for _, vs in changes.get('member', []) for v in vs) or True
+        mock_search.side_effect = lambda *a, **k: [
+            {'dn': 'CN=Test Group,OU=Groups,DC=test,DC=local', 'attributes': {'member': list(membros)}}]
         add_member_result = server.group_tools.add_member('TestGroup', 'CN=Test User,OU=Users,DC=test,DC=local')
+        mock_search.side_effect, mock_modify.side_effect = busca_anterior, None
         assert len(add_member_result) == 1
         add_member_data = json.loads(add_member_result[0].text)
         assert add_member_data['success'] == True
@@ -755,11 +763,18 @@ class TestMultiToolInteractionScenarios:
         user_data = json.loads(user_result[0].text)
         assert user_data['success'] == True
         
-        # 4. Add user to group
+        # 4. Add user to group (read back: the mock holds the change for this step)
+        membros = []
+        busca_anterior = mock_search.side_effect
+        mock_modify.side_effect = lambda dn, changes: membros.extend(
+            v for _, vs in changes.get('member', []) for v in vs) or True
+        mock_search.side_effect = lambda *a, **k: [
+            {'dn': 'CN=Marketing Team,OU=Groups,DC=test,DC=local', 'attributes': {'member': list(membros)}}]
         member_result = server.group_tools.add_member(
             'MarketingTeam', 
             'CN=Marketing User,OU=Users,DC=test,DC=local'
         )
+        mock_search.side_effect, mock_modify.side_effect = busca_anterior, None
         assert len(member_result) == 1
         member_data = json.loads(member_result[0].text)
         assert member_data['success'] == True

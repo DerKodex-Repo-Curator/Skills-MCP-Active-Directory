@@ -186,23 +186,21 @@ def test_multi_so_acrescenta_o_catalogo(server, single_server):
     A tool added later shows up in both automatically; if the sets ever differ
     by anything other than the catalogue tool, this fails.
     """
-    assert server.tools["ad_list_ad_servers"]["global"] is True
-    assert server.tools["ad_check_ad_server_configured"]["global"] is True
-    # Multi trades the two client-shaped catalogue tools for two server-shaped ones.
-    assert set(server.tools) - set(single_server.tools) == {
-        "ad_list_ad_servers", "ad_check_ad_server_configured",
-    }
-    assert set(single_server.tools) - set(server.tools) == {
-        "ad_list_configured_clients", "ad_check_client_configuration",
-    }
+    assert server.tools["ad_search_directory_servers"]["global"] is True
+    # Same ten tools in both modes since 2026-09-19; multi only adds the
+    # ad_server parameter to the ones bound to a directory.
+    assert set(server.tools) == set(single_server.tools)
+    assert "ad_server" in server.tools["ad_search_directory_users"]["inputSchema"]["properties"]
+    assert "ad_server" not in \
+        single_server.tools["ad_search_directory_users"]["inputSchema"]["properties"]
 
 
 def test_check_por_nome_de_cliente_devolve_o_ad_server(server):
-    achou = call(server, "ad_check_ad_server_configured", server_name="Cliente Beta")
+    achou = call(server, "ad_list_ad_servers", server_name="Cliente Beta")
     assert achou["exists"] is True
     assert achou["ad_server"] == "beta"
 
-    nao = call(server, "ad_check_ad_server_configured", server_name="Cliente Gama")
+    nao = call(server, "ad_list_ad_servers", server_name="Cliente Gama")
     assert nao["exists"] is False
     assert nao["erro"] == "AD_SERVER_DESCONHECIDO"
 
@@ -220,8 +218,8 @@ def test_modo_single_nao_ganha_o_parametro(single_server):
 
 def test_leitura_sem_ad_server_roda_em_todos(server):
     """The convenience the user asked for: no server named means look everywhere."""
-    server.tools["ad_list_users_with_filters"]["handler"] = lambda p: {"users": [{"cn": "x"}]}
-    payload = call(server, "ad_list_users_with_filters")
+    server.tools["ad_search_directory_users"]["handler"] = lambda p: {"users": [{"cn": "x"}]}
+    payload = call(server, "ad_search_directory_users")
     assert payload["modo_de_busca"] == "TODOS OS SERVIDORES"
     assert set(payload["encontrado_em"]) == {"alfa", "beta"}
     assert "nao foi informado" in payload["nota"]

@@ -84,8 +84,11 @@ class TestSingleMemberGroupRegression:
 
     def test_add_first_member_to_empty_group(self, group_tools, mock_ldap_manager):
         # Empty group: ldap3 may return member as None -> must not raise TypeError.
-        mock_ldap_manager.search.return_value = [
-            {"dn": "CN=NewGroup,DC=test,DC=local", "attributes": {"member": None}}
+        mock_ldap_manager.search.side_effect = [
+            [{"dn": "CN=NewGroup,DC=test,DC=local", "attributes": {"member": None}}],
+            # read-back after the add: ldap3 gives a single member as a str
+            [{"dn": "CN=NewGroup,DC=test,DC=local",
+              "attributes": {"member": "CN=user,DC=test,DC=local"}}],
         ]
         mock_ldap_manager.modify.return_value = True
         import json

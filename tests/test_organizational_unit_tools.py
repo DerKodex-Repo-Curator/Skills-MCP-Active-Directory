@@ -320,12 +320,25 @@ class TestOrganizationalUnitTools:
     
     def test_move_organizational_unit_success(self, ou_tools, mock_ldap_manager):
         """Test successful OU move operation."""
-        # Mock search for source OU
-        # LDAPManager.search always returns dn + attributes.
-        mock_ldap_manager.search.return_value = [
-            {'dn': 'OU=MoveMe,OU=OldParent,DC=test,DC=local',
-             'attributes': {'ou': ['MoveMe'], 'name': ['MoveMe']}}
-        ]
+        # One answer per searched DN, with single-valued attributes as plain
+        # strings -- what ldap3 really returns. The constant mock this replaced
+        # answered every search with the same entry and a LIST for 'name', which
+        # is how name[0] (the FIRST LETTER of a real string) survived as the
+        # reported new DN.
+        entradas = {
+            'OU=MoveMe,OU=OldParent,DC=test,DC=local': 'MoveMe',
+            'OU=NewParent,DC=test,DC=local': 'NewParent',
+            'OU=MoveMe,OU=NewParent,DC=test,DC=local': 'MoveMe',
+        }
+
+        def buscar(search_base, search_filter, attributes=None, search_scope=None, **_):
+            nome = entradas.get(search_base)
+            if nome is None:
+                return []
+            return [{'dn': search_base, 'attributes': {
+                'objectClass': ['top', 'organizationalUnit'], 'name': nome}}]
+
+        mock_ldap_manager.search.side_effect = buscar
         
         # Mock successful move operation
         mock_ldap_manager.move.return_value = True

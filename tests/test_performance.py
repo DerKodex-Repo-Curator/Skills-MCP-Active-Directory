@@ -44,8 +44,8 @@ def mock_server_with_performance_config(performance_config):
     """Mock server configured for performance testing."""
     with patch('active_directory_mcp.core.ldap_manager.LDAPManager.test_connection') as mock_test_conn, \
          patch('active_directory_mcp.core.ldap_manager.LDAPManager.connect') as mock_connect, \
-         patch('active_directory_mcp.server.load_config') as mock_load_config, \
-         patch('active_directory_mcp.server.validate_config'):
+         patch('active_directory_mcp.server_fastapi.load_config') as mock_load_config, \
+         patch('active_directory_mcp.server_fastapi.validate_config'):
         
         # Return mock config object with proper structure
         from active_directory_mcp.config.models import Config, ActiveDirectoryConfig, OrganizationalUnitsConfig, SecurityConfig, LoggingConfig, PerformanceConfig

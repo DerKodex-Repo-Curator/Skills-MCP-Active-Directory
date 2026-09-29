@@ -119,11 +119,14 @@ class TestUserTools:
         assert response_data['dn'] == 'CN=John Doe,OU=Users,DC=test,DC=local'
         assert response_data['attributes']['sAMAccountName'] == ['jdoe']
         assert response_data['computed']['enabled'] == True
+        # The groups come in the same answer (the separate group tool was merged).
+        assert [g['nome'] for g in response_data['resumo']['grupos']] == ['Domain Users', 'Sales']
+        assert response_data['resumo']['ou_caminho'] == 'Users'
         
         # Verify LDAP search was called with correct filter
-        mock_ldap_manager.search.assert_called_once()
-        call_args = mock_ldap_manager.search.call_args
+        call_args = mock_ldap_manager.search.call_args_list[0]
         assert 'sAMAccountName=jdoe' in call_args[1]['search_filter']
+        assert 'objectCategory=person' in call_args[1]['search_filter']
     
     def test_get_user_not_found(self, user_tools, mock_ldap_manager):
         """Test user not found scenario."""
@@ -173,7 +176,10 @@ class TestUserTools:
         # Verify LDAP operations were called
         mock_ldap_manager.search.assert_called()  # Check for existing user
         mock_ldap_manager.add.assert_called_once()  # Create user
-        assert mock_ldap_manager.modify.call_count == 2  # Set password and enable account
+        # password, enable, and "must change at next logon" (ADUC default)
+        assert mock_ldap_manager.modify.call_count == 3
+        mudancas = [c[0][1] for c in mock_ldap_manager.modify.call_args_list]
+        assert {'pwdLastSet': [('MODIFY_REPLACE', [0])]} in mudancas
     
     def test_create_user_already_exists(self, user_tools, mock_ldap_manager):
         """Test user creation when user already exists."""
@@ -206,7 +212,8 @@ class TestUserTools:
         """Test successful user enabling."""
         # Mock search for user
         mock_ldap_manager.search.return_value = [
-            {'dn': 'CN=Test User,OU=Users,DC=test,DC=local'}
+            {'dn': 'CN=Test User,OU=Users,DC=test,DC=local',
+             'attributes': {'userAccountControl': 514}}
         ]
         
         # Mock successful modify operation
@@ -234,7 +241,8 @@ class TestUserTools:
         """Test successful user disabling."""
         # Mock search for user
         mock_ldap_manager.search.return_value = [
-            {'dn': 'CN=Test User,OU=Users,DC=test,DC=local'}
+            {'dn': 'CN=Test User,OU=Users,DC=test,DC=local',
+             'attributes': {'userAccountControl': 512}}
         ]
         
         # Mock successful modify operation
@@ -283,8 +291,11 @@ class TestUserTools:
         assert response_data['success'] == True
         assert 'new_password' in response_data
         assert len(response_data['new_password']) >= 12  # Generated password should be at least 12 chars
-        assert response_data['force_change'] == True
-        
+        # Response now reports requested inputs and the verified effect separately.
+        assert response_data['requested']['force_change'] == True
+        assert 'set must change at next logon' in response_data['changes_applied']
+        assert 'effective' in response_data
+
         # Verify LDAP modify was called (password + force change)
         assert mock_ldap_manager.modify.call_count == 2
     

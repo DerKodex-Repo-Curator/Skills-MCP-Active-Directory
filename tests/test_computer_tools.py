@@ -253,7 +253,7 @@ class TestComputerTools:
         """Test successful computer deletion."""
         # Mock search for computer
         mock_ldap_manager.search.return_value = [
-            {'dn': 'CN=OLDPC,OU=Computers,DC=test,DC=local'}
+            {'dn': 'CN=OLDPC,OU=Computers,DC=test,DC=local', 'attributes': {'userAccountControl': 4096}}
         ]
         
         # Mock successful delete operation
@@ -278,7 +278,8 @@ class TestComputerTools:
         """Test successful computer enabling."""
         # Mock search for computer
         mock_ldap_manager.search.return_value = [
-            {'dn': 'CN=DISABLEDPC,OU=Computers,DC=test,DC=local'}
+            {'dn': 'CN=DISABLEDPC,OU=Computers,DC=test,DC=local',
+             'attributes': {'userAccountControl': 4098}}
         ]
         
         # Mock successful modify operation
@@ -306,7 +307,8 @@ class TestComputerTools:
         """Test successful computer disabling."""
         # Mock search for computer
         mock_ldap_manager.search.return_value = [
-            {'dn': 'CN=ENABLEDPC,OU=Computers,DC=test,DC=local'}
+            {'dn': 'CN=ENABLEDPC,OU=Computers,DC=test,DC=local',
+             'attributes': {'userAccountControl': 4096}}
         ]
         
         # Mock successful modify operation
@@ -334,7 +336,7 @@ class TestComputerTools:
         """Test successful computer password reset."""
         # Mock search for computer
         mock_ldap_manager.search.return_value = [
-            {'dn': 'CN=TESTPC,OU=Computers,DC=test,DC=local'}
+            {'dn': 'CN=TESTPC,OU=Computers,DC=test,DC=local', 'attributes': {'userAccountControl': 4096}}
         ]
         
         # Mock successful modify operations
@@ -350,12 +352,15 @@ class TestComputerTools:
         # Parse JSON response
         response_data = json.loads(result[0].text)
         assert response_data['success'] == True
-        assert 'password reset successfully' in response_data['message']
-        assert 'new_password' in response_data
-        assert len(response_data['new_password']) >= 32  # Computer passwords are long
+        assert 'new random password written, not returned' in response_data['message']
+        # The old answer carried a random password that was never written.
+        assert 'new_password' not in response_data
+        assert 'Test-ComputerSecureChannel' in response_data['next_step']
         
-        # Verify LDAP modify was called (password reset)
-        mock_ldap_manager.modify.assert_called()
+        # a strong random password is WRITTEN (never ADUC's guessable default)
+        mudanca = mock_ldap_manager.modify.call_args[0][1]
+        gravada = mudanca['unicodePwd'][0][1][0]
+        assert gravada != '"testpc"'.encode('utf-16-le') and len(gravada) > 40
     
     def test_get_computer_status_success(self, computer_tools, mock_ldap_manager):
         """Test successful computer status retrieval."""
