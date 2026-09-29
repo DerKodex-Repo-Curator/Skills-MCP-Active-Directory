@@ -30,7 +30,9 @@ def setup_logging(config: LoggingConfig) -> logging.Logger:
     formatter = logging.Formatter(config.format)
     
     # Console handler
-    console_handler = logging.StreamHandler(sys.stdout)
+    # stderr, never stdout: on the stdio transport stdout carries the JSON-RPC
+    # frames, and a log line in the middle of them corrupts the session.
+    console_handler = logging.StreamHandler(sys.stderr)
     console_handler.setLevel(getattr(logging, config.level))
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
